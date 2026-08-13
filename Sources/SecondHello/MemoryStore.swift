@@ -48,7 +48,10 @@ final class MemoryStore: ObservableObject {
     init(repository: any MemoryRepository = JSONMemoryRepository()) {
         self.repository = repository
         reload()
-        Task { await checkServer() }
+        Task {
+            await checkServer()
+            await refreshOpportunities()
+        }
     }
 
     func reload() {

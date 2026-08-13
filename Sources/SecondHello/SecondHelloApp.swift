@@ -22,6 +22,65 @@ struct ContentView: View {
     @State private var captureConsent = false
     @State private var captureImporting = false
     @State private var captureStatus = ""
+
+    private func detectedName(in transcript: String) -> String? {
+        let lower = transcript.lowercased()
+        for lead in ["my name is ", "i'm ", "i am "] {
+            guard let range = lower.range(of: lead) else { continue }
+            let offset = lower.distance(from: lower.startIndex, to: range.upperBound)
+            let start = transcript.index(transcript.startIndex, offsetBy: offset)
+            let tail = transcript[start...]
+            let candidate = tail.split(whereSeparator: { ",.!?;\n".contains($0) }).first.map(String.init) ?? ""
+            let words = candidate.split(separator: " ").prefix(3).map(String.init)
+            guard !words.isEmpty else { continue }
+            let rejected = ["a", "an", "looking", "interested", "working", "seeking"]
+            guard !rejected.contains(words[0].lowercased()) else { continue }
+            return words.joined(separator: " ")
+        }
+        return nil
+    }
+
+    private func finishCaptureAndOpenOpportunities() {
+        guard !store.isWorking else { return }
+        captureStatus = "Finalizing the transcript…"
+        Task { @MainActor in
+            // Let ElevenLabs deliver the final utterance before closing its socket.
+            try? await Task.sleep(for: .milliseconds(900))
+            let liveTranscript = voiceAgent.transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+            let fallbackTranscript = listener.transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+            let transcript = liveTranscript.isEmpty ? fallbackTranscript : liveTranscript
+            listener.transcript = transcript
+            if captureName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                captureName = detectedName(in: transcript) ?? ""
+            }
+            listener.stop(); voiceAgent.stop()
+
+            let finalName = captureName.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard captureConsent else {
+                captureStatus = "Listening stopped because consent is no longer active."
+                return
+            }
+            guard !finalName.isEmpty else {
+                captureStatus = "Say your name during the conversation or enter it before finishing."
+                selection = AppSection.capture.rawValue
+                return
+            }
+            guard !transcript.isEmpty else {
+                captureStatus = "No speech was captured. Start listening and try again."
+                selection = AppSection.capture.rawValue
+                return
+            }
+
+            captureStatus = "Saving consented memory to Atlas and finding opportunities…"
+            if await store.capture(name: finalName, email: captureEmail, transcript: transcript, consented: true) {
+                captureStatus = "Memory saved. Opportunities are ready."
+                selection = AppSection.opportunities.rawValue
+            } else {
+                captureStatus = store.lastError ?? "The memory workflow could not complete."
+                selection = AppSection.capture.rawValue
+            }
+        }
+    }
     var body: some View {
         NavigationSplitView {
             VStack(alignment: .leading, spacing: 20) {
@@ -41,10 +100,9 @@ struct ContentView: View {
                     VStack(alignment: .leading, spacing: 8) {
                         Label("Background listening active", systemImage: "waveform")
                             .font(.caption.bold()).foregroundStyle(.green)
-                        Button("Stop listening") {
-                            listener.stop(); voiceAgent.stop()
-                            captureStatus = "Voice session stopped. Review the transcript before saving."
-                        }.buttonStyle(.bordered)
+                        Button(store.isWorking ? "Finding opportunities…" : "Stop & find opportunities") {
+                            finishCaptureAndOpenOpportunities()
+                        }.buttonStyle(.bordered).disabled(store.isWorking)
                     }
                 }
                 VStack(alignment: .leading, spacing: 4) {
@@ -64,7 +122,8 @@ struct ContentView: View {
                 importing: $captureImporting,
                 status: $captureStatus,
                 listener: listener,
-                voiceAgent: voiceAgent
+                voiceAgent: voiceAgent,
+                onFinish: finishCaptureAndOpenOpportunities
             )
             case .opportunities: OpportunitiesView()
             case .people: PeopleView()
@@ -142,6 +201,7 @@ struct CaptureView: View {
     @Binding var status: String
     @ObservedObject var listener: LiveListeningService
     @ObservedObject var voiceAgent: ElevenLabsConversationService
+    let onFinish: () -> Void
     private let scenario = DemoScenario.load()
     private var isCapturing: Bool { listener.isListening || voiceAgent.isActive }
     private var activeLevel: Double { voiceAgent.isActive ? voiceAgent.audioLevel : listener.audioLevel }
@@ -150,29 +210,6 @@ struct CaptureView: View {
 
     private func stopCapture() {
         listener.stop(); voiceAgent.stop()
-    }
-
-    private func stopAndFindOpportunities() {
-        stopCapture()
-        let capturedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        let capturedTranscript = listener.transcript.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !capturedName.isEmpty else {
-            status = "Say your name during the conversation or enter it before finishing."
-            return
-        }
-        guard !capturedTranscript.isEmpty else {
-            status = "No speech was captured. Start listening and try again."
-            return
-        }
-        status = "Saving consented memory to Atlas and finding opportunities…"
-        Task {
-            if await store.capture(name: capturedName, email: email, transcript: capturedTranscript, consented: consent) {
-                status = "Memory saved. Opportunities are ready."
-                onSaved()
-            } else {
-                status = store.lastError ?? "The memory workflow could not complete."
-            }
-        }
     }
 
     private func resetCapture() {
@@ -248,7 +285,7 @@ struct CaptureView: View {
                         Text(activeEngine).font(.caption).foregroundStyle(.tertiary)
                         HStack {
                             if isCapturing {
-                                Button(store.isWorking ? "Finding opportunities…" : "Stop & find opportunities") { stopAndFindOpportunities() }
+                                Button(store.isWorking ? "Finding opportunities…" : "Stop & find opportunities") { onFinish() }
                                     .buttonStyle(.borderedProminent).controlSize(.large).disabled(store.isWorking)
                             } else {
                                 Button("Start background capture") { startCapture() }.buttonStyle(.borderedProminent).controlSize(.large).disabled(!consent)
