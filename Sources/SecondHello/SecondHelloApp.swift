@@ -152,6 +152,29 @@ struct CaptureView: View {
         listener.stop(); voiceAgent.stop()
     }
 
+    private func stopAndFindOpportunities() {
+        stopCapture()
+        let capturedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let capturedTranscript = listener.transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !capturedName.isEmpty else {
+            status = "Say your name during the conversation or enter it before finishing."
+            return
+        }
+        guard !capturedTranscript.isEmpty else {
+            status = "No speech was captured. Start listening and try again."
+            return
+        }
+        status = "Saving consented memory to Atlas and finding opportunities…"
+        Task {
+            if await store.capture(name: capturedName, email: email, transcript: capturedTranscript, consented: consent) {
+                status = "Memory saved. Opportunities are ready."
+                onSaved()
+            } else {
+                status = store.lastError ?? "The memory workflow could not complete."
+            }
+        }
+    }
+
     private func resetCapture() {
         listener.reset(); voiceAgent.reset()
     }
@@ -206,7 +229,7 @@ struct CaptureView: View {
                 }
                 HStack { TextField("Person’s name", text: $name); TextField("Email for a future draft (optional)", text: $email) }.textFieldStyle(.roundedBorder)
                 HStack(spacing: 14) {
-                    Toggle(isOn: $consent) { VStack(alignment: .leading) { Text("They explicitly agreed to live listening").fontWeight(.semibold); Text("Unlocks the microphone. Nothing is stored until you review and save.").font(.caption).foregroundStyle(.secondary) } }.toggleStyle(.switch)
+                    Toggle(isOn: $consent) { VStack(alignment: .leading) { Text("They explicitly agreed to live listening").fontWeight(.semibold); Text("Unlocks the microphone. Stopping publishes only this consented memory and its matched opportunities.").font(.caption).foregroundStyle(.secondary) } }.toggleStyle(.switch)
                     Spacer()
                     Label(consent ? "Permission active" : "Microphone locked", systemImage: consent ? "checkmark.shield.fill" : "lock.fill").font(.caption.bold()).foregroundStyle(consent ? Color.green : Color.secondary)
                 }.padding(14).background(consent ? .green.opacity(0.09) : .secondary.opacity(0.07), in: RoundedRectangle(cornerRadius: 12))
@@ -225,7 +248,8 @@ struct CaptureView: View {
                         Text(activeEngine).font(.caption).foregroundStyle(.tertiary)
                         HStack {
                             if isCapturing {
-                                Button("Stop and review") { stopCapture(); status = "Voice session stopped. Review the transcript before saving." }.buttonStyle(.borderedProminent).controlSize(.large)
+                                Button(store.isWorking ? "Finding opportunities…" : "Stop & find opportunities") { stopAndFindOpportunities() }
+                                    .buttonStyle(.borderedProminent).controlSize(.large).disabled(store.isWorking)
                             } else {
                                 Button("Start background capture") { startCapture() }.buttonStyle(.borderedProminent).controlSize(.large).disabled(!consent)
                             }
