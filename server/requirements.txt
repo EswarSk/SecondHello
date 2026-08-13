@@ -1,0 +1,4 @@
+# Optional production dependencies. Offline Demo Mode needs none of them.
+langgraph>=0.6,<2
+pymongo>=4.8,<5
+python-dotenv>=1,<2

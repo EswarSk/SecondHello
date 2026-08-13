@@ -1,0 +1,15 @@
+{
+  "event": "Climate Founders Night",
+  "guests": [
+    {
+      "name": "Maya Chen",
+      "email": "maya@example.com",
+      "transcript": "Our early-stage climate fund needs a technical cofounder with applied ML experience. I can offer founder introductions and a patient ear on fundraising. I'm interested in climate software. I will send the fund thesis on Friday."
+    },
+    {
+      "name": "Daniel Ortiz",
+      "email": "daniel@example.com",
+      "transcript": "I build applied ML systems and I'm looking for a mission-driven climate startup. I can offer hands-on ML architecture and prototype reviews. I care about climate software and responsible AI. I will share my portfolio tomorrow."
+    }
+  ]
+}
