@@ -89,11 +89,19 @@ final class MemoryStore: ObservableObject {
         let conversationID = UUID()
         let local = LocalExtractor.extract(transcript, conversationID: conversationID)
         var profile = local
+        var serverOpportunities: [ServerOpportunity]?
         let shell = Conversation(id: conversationID, personID: person.id, consented: true, consentedAt: .now, transcript: transcript, profile: Profile())
+
+        // A consented person should appear in People immediately. Public
+        // research can continue without making the successful save look lost.
+        let localConversation = Conversation(id: conversationID, personID: person.id, consented: true, consentedAt: .now, transcript: transcript, profile: local)
+        memory.conversations.append(localConversation)
+        persist()
         do {
             let result = try await WorkflowClient.run(action: "capture", values: ["person": try WorkflowClient.jsonObject(person), "conversation": try WorkflowClient.jsonObject(shell)])
             guard result.ok else { throw NSError(domain: "SecondHello", code: 1, userInfo: [NSLocalizedDescriptionKey: result.reason ?? "Workflow rejected capture"]) }
             profile = result.profile ?? local
+            serverOpportunities = result.opportunities
             traces = result.trace ?? []
             workflowStatus = "Agent completed"
             workflowDetail = traces.map(\.mode).uniqued().joined(separator: " · ")
@@ -111,8 +119,14 @@ final class MemoryStore: ObservableObject {
         let conversation = Conversation(id: conversationID, personID: person.id, consented: true, consentedAt: .now, transcript: transcript, profile: profile)
         memory.conversations.removeAll { $0.id == conversationID }
         memory.conversations.append(conversation)
-        persist(); isWorking = false
-        await refreshOpportunities()
+        persist()
+        if let serverOpportunities {
+            remoteOpportunities = serverOpportunities.compactMap(mapOpportunity)
+            await checkServer()
+        } else {
+            remoteOpportunities = localIntroductions()
+        }
+        isWorking = false
         return true
     }
 
@@ -177,11 +191,28 @@ final class MemoryStore: ObservableObject {
     func refreshOpportunities() async {
         guard WorkflowClient.baseURL != nil else { remoteOpportunities = []; return }
         do {
+            try await mergeServerMemory()
             let result = try await WorkflowClient.run(action: "match")
             traces = result.trace ?? traces
             remoteOpportunities = (result.opportunities ?? []).compactMap(mapOpportunity)
             await checkServer()
         } catch { remoteOpportunities = [] }
+    }
+
+    /// Atlas is authoritative when connected, while UUID-based merging keeps
+    /// unsynced offline records intact for the next successful live session.
+    private func mergeServerMemory() async throws {
+        let remote = try await WorkflowClient.memory()
+        for person in remote.people {
+            if let index = memory.people.firstIndex(where: { $0.id == person.id }) { memory.people[index] = person }
+            else { memory.people.append(person) }
+        }
+        for conversation in remote.conversations {
+            if let index = memory.conversations.firstIndex(where: { $0.id == conversation.id }) { memory.conversations[index] = conversation }
+            else { memory.conversations.append(conversation) }
+        }
+        memory.schemaVersion = max(memory.schemaVersion, remote.schemaVersion)
+        persist()
     }
 
     private func mapOpportunity(_ value: ServerOpportunity) -> Introduction? {

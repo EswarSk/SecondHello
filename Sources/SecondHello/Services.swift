@@ -38,18 +38,30 @@ enum WorkflowClient {
         guard !raw.isEmpty else { return nil }
         return URL(string: raw.hasSuffix("/") ? String(raw.dropLast()) : raw)
     }
+    private static func request(_ url: URL, timeout: TimeInterval) -> URLRequest {
+        var request = URLRequest(url: url); request.timeoutInterval = timeout
+        let token = ProcessInfo.processInfo.environment["SECONDHELLO_AUTH_TOKEN"] ?? UserDefaults.standard.string(forKey: "serverToken") ?? ""
+        if !token.isEmpty { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
+        return request
+    }
     static func health() async throws -> ServerHealth {
         guard let baseURL else { throw WorkflowError.notConfigured }
-        var request = URLRequest(url: baseURL.appendingPathComponent("health")); request.timeoutInterval = 2
+        let request = request(baseURL.appendingPathComponent("health"), timeout: 2)
         let (data, response) = try await URLSession.shared.data(for: request)
         guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw WorkflowError.requestFailed }
         return try JSONDecoder.secondHello.decode(ServerHealth.self, from: data)
     }
+    static func memory() async throws -> StoredMemory {
+        guard let baseURL else { throw WorkflowError.notConfigured }
+        let request = request(baseURL.appendingPathComponent("memory"), timeout: 8)
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw WorkflowError.requestFailed }
+        return try JSONDecoder.secondHello.decode(StoredMemory.self, from: data)
+    }
     static func run(action: String, values: [String: Any] = [:]) async throws -> WorkflowResponse {
         guard let baseURL else { throw WorkflowError.notConfigured }
-        var request = URLRequest(url: baseURL.appendingPathComponent("workflow"))
+        var request = request(baseURL.appendingPathComponent("workflow"), timeout: 90)
         // Extraction + embeddings can exceed 15 seconds on a cold provider call.
-        request.timeoutInterval = 90
         request.httpMethod = "POST"; request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         var payload: [String: Any] = ["action": action]
         values.forEach { payload[$0.key] = $0.value }
@@ -60,7 +72,7 @@ enum WorkflowClient {
     }
     static func elevenLabsSignedURL() async throws -> URL {
         guard let baseURL else { throw WorkflowError.notConfigured }
-        var request = URLRequest(url: baseURL.appendingPathComponent("elevenlabs/signed-url")); request.timeoutInterval = 8
+        let request = request(baseURL.appendingPathComponent("elevenlabs/signed-url"), timeout: 8)
         let (data, response) = try await URLSession.shared.data(for: request)
         guard (response as? HTTPURLResponse)?.statusCode == 200,
               let signed = try? JSONDecoder().decode(SignedConversation.self, from: data),
@@ -85,6 +97,98 @@ enum WorkflowClient {
     }
 }
 
+/// Extracts a speaker's explicitly introduced name without treating phrases
+/// such as “I'm just trying…” or “I am looking…” as identities.
+enum SpeakerIdentityDetector {
+    private struct Rule {
+        let pattern: String
+        let priority: Int
+    }
+
+    private static let rules = [
+        Rule(pattern: #"\bmy\s+name\s+is\s+([^\n.!?,;:]+)"#, priority: 300),
+        Rule(pattern: #"\bthis\s+is\s+([^\n.!?,;:]+)"#, priority: 250),
+        Rule(pattern: #"\b(?:and\s+)?i\s+am\s+([^\n.!?,;:]+)"#, priority: 200),
+        Rule(pattern: #"\bi[’']m\s+([^\n.!?,;:]+)"#, priority: 100)
+    ]
+
+    private static let rejectedFirstWords: Set<String> = [
+        "a", "an", "at", "building", "currently", "from", "going", "here",
+        "hoping", "interested", "just", "looking", "seeking", "the", "trying",
+        "working"
+    ]
+    private static let boundaryWords: Set<String> = [
+        "and", "at", "because", "but", "from", "i", "so", "that", "uh", "um",
+        "we", "who", "with", "work", "working"
+    ]
+
+    static func detect(in transcript: String) -> String? {
+        var best: (name: String, priority: Int, location: Int)?
+        let fullRange = NSRange(transcript.startIndex..., in: transcript)
+
+        for rule in rules {
+            guard let expression = try? NSRegularExpression(pattern: rule.pattern, options: [.caseInsensitive]) else { continue }
+            for match in expression.matches(in: transcript, range: fullRange) {
+                guard match.numberOfRanges > 1,
+                      let range = Range(match.range(at: 1), in: transcript),
+                      let name = normalizedName(from: String(transcript[range])) else { continue }
+                let candidate = (name, rule.priority, match.range.location)
+                if best == nil || candidate.1 > best!.priority || (candidate.1 == best!.priority && candidate.2 > best!.location) {
+                    best = candidate
+                }
+            }
+        }
+        return best?.name
+    }
+
+    private static func normalizedName(from value: String) -> String? {
+        var words: [String] = []
+        for rawWord in value.split(whereSeparator: \ .isWhitespace).prefix(8) {
+            let word = String(rawWord).trimmingCharacters(in: CharacterSet.letters.union(CharacterSet(charactersIn: "-'’")).inverted)
+            guard !word.isEmpty else { continue }
+            let lower = word.lowercased()
+            if words.isEmpty && rejectedFirstWords.contains(lower) { return nil }
+            if !words.isEmpty && boundaryWords.contains(lower) { break }
+            words.append(word)
+            if words.count == 3 { break }
+        }
+        guard !words.isEmpty else { return nil }
+        return words.map { word in
+            guard let first = word.first else { return word }
+            return String(first).uppercased() + word.dropFirst()
+        }.joined(separator: " ")
+    }
+}
+
+enum HumanTranscript {
+    static func preferred(_ first: String, _ second: String) -> String {
+        wordCount(first) >= wordCount(second) ? first : second
+    }
+
+    static func isLikelyAgentEcho(_ value: String, agentResponse: String) -> Bool {
+        let candidate = normalized(value)
+        guard !candidate.isEmpty else { return true }
+        let knownEchoes = [
+            "listen quietly in the background", "quietly in the background",
+            "i will listen", "i will now listen"
+        ]
+        if knownEchoes.contains(where: { candidate == $0 || candidate.hasPrefix($0 + " ") }) { return true }
+        let response = normalized(agentResponse)
+        guard wordCount(candidate) >= 3, !response.isEmpty else { return false }
+        return response.contains(candidate)
+    }
+
+    private static func wordCount(_ value: String) -> Int {
+        value.split(whereSeparator: { !$0.isLetter && !$0.isNumber }).count
+    }
+
+    private static func normalized(_ value: String) -> String {
+        value.lowercased()
+            .split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+            .joined(separator: " ")
+    }
+}
+
 enum MailDraftOpener {
     static func url(for draft: IntroductionDraft) -> URL? {
         var components = URLComponents(); components.scheme = "mailto"; components.path = draft.to
@@ -96,6 +200,61 @@ enum MailDraftOpener {
     @MainActor static func open(_ draft: IntroductionDraft) -> Bool {
         guard let url = url(for: draft) else { return false }
         return NSWorkspace.shared.open(url)
+    }
+}
+
+/// Speech and Core Audio invoke these callbacks on framework-owned queues.
+/// The pipeline is deliberately non-actor-isolated and forwards only small,
+/// Sendable values to the MainActor UI.
+private final class AppleSpeechPipeline: @unchecked Sendable {
+    let request: SFSpeechAudioBufferRecognitionRequest
+    let onLevel: @MainActor @Sendable (Double) -> Void
+    let onResult: @MainActor @Sendable (String?, Bool, String?) -> Void
+
+    init(
+        request: SFSpeechAudioBufferRecognitionRequest,
+        onLevel: @escaping @MainActor @Sendable (Double) -> Void,
+        onResult: @escaping @MainActor @Sendable (String?, Bool, String?) -> Void
+    ) {
+        self.request = request
+        self.onLevel = onLevel
+        self.onResult = onResult
+    }
+
+    func process(_ buffer: AVAudioPCMBuffer) {
+        request.append(buffer)
+        guard let samples = buffer.floatChannelData?[0] else { return }
+        let count = Int(buffer.frameLength)
+        guard count > 0 else { return }
+        var power: Float = 0
+        for index in 0..<count { power += samples[index] * samples[index] }
+        let rms = sqrt(power / Float(count))
+        let decibels = 20 * log10(max(rms, 0.000_01))
+        let level = Double(min(max((decibels + 50) / 50, 0), 1))
+        Task { @MainActor [onLevel] in onLevel(level) }
+    }
+
+    func receive(_ result: SFSpeechRecognitionResult?, error: Error?) {
+        let text = result?.bestTranscription.formattedString
+        let final = result?.isFinal ?? false
+        let failure = error?.localizedDescription
+        Task { @MainActor [onResult] in onResult(text, final, failure) }
+    }
+}
+
+private func installAppleSpeechInputTap(on input: AVAudioInputNode, format: AVAudioFormat, pipeline: AppleSpeechPipeline) {
+    input.installTap(onBus: 0, bufferSize: 1_024, format: format) { buffer, _ in
+        pipeline.process(buffer)
+    }
+}
+
+private func startAppleSpeechRecognition(
+    recognizer: SFSpeechRecognizer,
+    request: SFSpeechAudioBufferRecognitionRequest,
+    pipeline: AppleSpeechPipeline
+) -> SFSpeechRecognitionTask {
+    recognizer.recognitionTask(with: request) { result, error in
+        pipeline.receive(result, error: error)
     }
 }
 
@@ -113,6 +272,7 @@ final class LiveListeningService: ObservableObject {
     private let audioEngine = AVAudioEngine()
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
+    private var inputPipeline: AppleSpeechPipeline?
     private var tapInstalled = false
     private var acceptingResults = false
 
@@ -149,31 +309,19 @@ final class LiveListeningService: ObservableObject {
         let input = audioEngine.inputNode
         if tapInstalled { input.removeTap(onBus: 0); tapInstalled = false }
         let format = input.outputFormat(forBus: 0)
-        input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self, weak request] buffer, _ in
-            request?.append(buffer)
-            guard let samples = buffer.floatChannelData?[0] else { return }
-            let count = Int(buffer.frameLength)
-            guard count > 0 else { return }
-            var power: Float = 0
-            for index in 0..<count { power += samples[index] * samples[index] }
-            let rms = sqrt(power / Float(count))
-            let decibels = 20 * log10(max(rms, 0.000_01))
-            let level = Double(min(max((decibels + 50) / 50, 0), 1))
-            Task { @MainActor [weak self] in self?.audioLevel = level }
-        }
+        let pipeline = AppleSpeechPipeline(request: request, onLevel: { [weak self] level in
+            self?.audioLevel = level
+        }, onResult: { [weak self] text, final, failure in
+            guard let self, self.acceptingResults else { return }
+            if let text { self.transcript = text }
+            if let failure, !final { self.phase = .unavailable(failure); self.stopAudio() }
+            else if final { self.stop() }
+        })
+        inputPipeline = pipeline
+        installAppleSpeechInputTap(on: input, format: format, pipeline: pipeline)
         tapInstalled = true
 
-        recognitionTask = recognizer.recognitionTask(with: request) { [weak self] result, error in
-            let text = result?.bestTranscription.formattedString
-            let final = result?.isFinal ?? false
-            let failure = error?.localizedDescription
-            Task { @MainActor [weak self] in
-                guard let self, self.acceptingResults else { return }
-                if let text { self.transcript = text }
-                if let failure, !final { self.phase = .unavailable(failure); self.stopAudio() }
-                else if final { self.stop() }
-            }
-        }
+        recognitionTask = startAppleSpeechRecognition(recognizer: recognizer, request: request, pipeline: pipeline)
 
         do {
             audioEngine.prepare()
@@ -201,13 +349,22 @@ final class LiveListeningService: ObservableObject {
         if tapInstalled { audioEngine.inputNode.removeTap(onBus: 0); tapInstalled = false }
         recognitionRequest?.endAudio()
         recognitionTask?.cancel()
-        recognitionTask = nil; recognitionRequest = nil; audioLevel = 0
+        recognitionTask = nil; recognitionRequest = nil; inputPipeline = nil; audioLevel = 0
     }
 
     private func speechPermission() async -> Bool {
         if SFSpeechRecognizer.authorizationStatus() == .authorized { return true }
+        return await Self.requestSpeechAuthorization()
+    }
+
+    /// TCC owns the callback queue. Keeping the whole bridge nonisolated avoids
+    /// Swift 6 checking an Apple background callback against MainActor before
+    /// the continuation has a chance to resume its actor-bound caller.
+    private nonisolated static func requestSpeechAuthorization() async -> Bool {
         return await withCheckedContinuation { continuation in
-            SFSpeechRecognizer.requestAuthorization { continuation.resume(returning: $0 == .authorized) }
+            SFSpeechRecognizer.requestAuthorization { status in
+                continuation.resume(returning: status == .authorized)
+            }
         }
     }
 
@@ -394,6 +551,8 @@ final class ElevenLabsConversationService: ObservableObject {
         }
         inputConverter = converter
         let pipeline = ElevenLabsInputAudioPipeline(converter: converter, targetFormat: targetFormat) { [weak self] level, pcm in
+            // Never gate microphone packets on playback state. A delayed audio
+            // completion callback must not permanently mute the human speaker.
             guard let self, self.isListening else { return }
             self.audioLevel = level
             self.sendJSON(["user_audio_chunk": pcm.base64EncodedString()])
@@ -492,6 +651,7 @@ final class ElevenLabsConversationService: ObservableObject {
     private func appendTranscript(_ value: String) {
         let cleaned = value.trimmingCharacters(in: .whitespacesAndNewlines)
         guard cleaned.unicodeScalars.contains(where: CharacterSet.alphanumerics.contains) else { return }
+        guard !HumanTranscript.isLikelyAgentEcho(cleaned, agentResponse: agentResponse) else { return }
         let lines = transcript.split(separator: "\n").map(String.init)
         guard lines.last != cleaned else { return }
         transcript += (transcript.isEmpty ? "" : "\n") + cleaned

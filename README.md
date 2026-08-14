@@ -1,14 +1,67 @@
 # Second Hello
 
-Second Hello is a consent-first networking memory agent for macOS. It turns explicitly permitted conversations into structured memory, finds evidence-backed introductions, and prepares a human-reviewed draft in the default mail app. It never sends a message autonomously.
+Second Hello is a self-hostable, consent-first networking memory agent. It turns explicitly permitted conversations into structured memory, researches public professional context, finds evidence-backed introductions, and prepares a human-reviewed handoff. It never sends a message autonomously.
+
+The production surface is a browser/PWA client served by the local agent service. The macOS client remains available as an optional native client. Each deployment owns its data and provider credentials; no Second Hello-hosted account is required.
+
+## Self-hosted production deployment
+
+The supported deployment is one container with a durable volume. Copy the sanitized configuration, create a strong instance token, then build and run:
+
+```zsh
+cd /Users/eswaravegi/projects/resume/SecondHello
+cp .env.example .env
+openssl rand -hex 32
+# Put the generated value in .env as SECONDHELLO_AUTH_TOKEN=...
+docker compose up --build
+```
+
+Open `http://127.0.0.1:8765`. Paste the same bearer token into **Settings & deployment**. Configure Atlas, ElevenLabs, OpenRouter, or Fireworks in `.env`; the app stays usable with local JSON and deterministic local logic when those values are absent. For an internet-facing deployment, terminate TLS at a reverse proxy and set `SECONDHELLO_CORS_ORIGINS` to the exact browser origins. Do not expose the plain HTTP port directly to the public internet.
+
+For a local developer run without Docker:
+
+```zsh
+cd /Users/eswaravegi/projects/resume/SecondHello/web
+pnpm install --frozen-lockfile
+pnpm exec vite build
+cd ..
+scripts/run-server.sh
+```
+
+`scripts/run-server.sh` uses the FastAPI/Uvicorn ASGI entrypoint when the production dependencies are installed and falls back to the standard-library boundary for zero-dependency local runs. `SECONDHELLO_ENV=production` requires `SECONDHELLO_AUTH_TOKEN`; development mode is intentionally unauthenticated only on loopback.
+
+The optional local MongoDB profile is:
+
+```zsh
+docker compose --profile mongo up --build
+```
+
+Set `MONGODB_URI=mongodb://mongo:27017/secondhello` when using it. Atlas remains the recommended durable store for multi-process deployments; local JSON is designed for one self-hosted instance and is protected by atomic writes.
+
+The production API provides:
+
+- `GET /api/health` and `GET /api/readyz` for liveness/readiness.
+- `POST /api/workflow` for a durable workflow result.
+- `POST /api/workflow/events` for streamed LangGraph node events over SSE.
+- `GET /api/memory/export` for a user-authorized export.
+- `DELETE /api/memory` only with `X-SecondHello-Confirm: DELETE_ALL`.
+- `GET /api/voice/signed-url` for a short-lived ElevenLabs session URL; the provider key never reaches the browser.
+- `POST /api/voice/scribe-token` for a single-use ElevenLabs Scribe realtime transcription token; the provider key never reaches the browser.
+
+Run the complete release check before distributing a build:
+
+```zsh
+./scripts/check-release.sh
+```
 
 ## The 90-second demo
 
 The demo tells one complete story rather than touring settings:
 
-1. Start the local server, open **Remember**, confirm consent, choose **Start background capture**, and speak. The private ElevenLabs agent acknowledges once, then listens quietly; say “Second Hello” to address it. If it is not configured or cannot connect, the app switches to Apple Speech capture automatically. You can also load the first guest from the bundled “Climate Founders Night” scenario. Notice that consent defaults off; the microphone, extraction, and storage are blocked.
-2. Confirm consent and choose **Remember with permission**. The live receipt shows the policy gate, extraction tool, persistence tool, and matching tool.
-3. Repeat for the second guest. The app opens **Connections worth making** with a semantic match.
+1. Open the local live room, arm consent, and choose **Start live room**. The private ElevenLabs voice agent and Scribe realtime speech-to-text connect together; partial speech appears immediately while committed turns enter the transcript.
+2. Keep talking. Once a clear name and meaningful context are present, the LangGraph workflow starts automatically in the background. Its guard, extraction, public research, evidence, persistence, and matching events appear in the **Live agent activity** sidecar while the room remains open.
+3. Stop the room only when you want the final sync. There is no “Remember person” submit step; consented turns are saved continuously and the final state updates People, evidence, and Opportunities.
+4. Choose an opportunity to review the editable introduction draft. The mail handoff remains human-approved and nothing is sent automatically.
 4. Choose **Show evidence** to reveal the exact source excerpts behind both sides of the match.
 5. Choose **Prepare introduction**, review the editable draft, explicitly approve the handoff, and open a real draft in the default mail app. The mail app remains responsible for sending.
 

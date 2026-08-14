@@ -99,6 +99,22 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("agent_id=agent-test", request.full_url)
         self.assertNotIn("server-only-test-key", str(payload))
 
+    def test_scribe_token_uses_server_key_without_returning_it(self):
+        class Response:
+            def __enter__(self): return self
+            def __exit__(self, *_): return False
+            def read(self): return b'{"token":"sutkn-test"}'
+
+        os.environ["ELEVENLABS_API_KEY"] = "server-only-scribe-key"
+        with patch.object(main.urllib.request, "urlopen", return_value=Response()) as urlopen:
+            status, payload = main.elevenlabs_scribe_token()
+
+        request = urlopen.call_args.args[0]
+        self.assertEqual(status, 200)
+        self.assertEqual(payload, {"ok": True, "token": "sutkn-test", "modelId": "scribe_v2_realtime"})
+        self.assertEqual(request.get_header("Xi-api-key"), "server-only-scribe-key")
+        self.assertNotIn("server-only-scribe-key", str(payload))
+
     def test_provider_requires_explicit_key_and_model(self):
         os.environ["FIREWORKS_API_KEY"] = "configured-for-test"
         os.environ["FIREWORKS_MODEL"] = ""

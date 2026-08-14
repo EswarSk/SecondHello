@@ -249,26 +249,35 @@ class Provider:
         except (urllib.error.URLError, TimeoutError, KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError):
             return {}, "Public research unavailable"
 
-    def embedding(self, text: str, purpose: str = "document") -> tuple[list[float], str]:
+    def embeddings(self, texts: list[str], purpose: str = "document") -> tuple[list[list[float]], str]:
+        if not texts:
+            return [], self.name if self.configured and self.embedding_model else "Local deterministic"
         if self.configured and self.embedding_model:
             try:
-                embedding_input = text
+                embedding_inputs = list(texts)
                 if self.name == "Fireworks" and "qwen3-embedding" in self.embedding_model.lower() and purpose == "query":
-                    embedding_input = (
+                    embedding_inputs = [(
                         "Instruct: Find a person whose explicitly stated offer can satisfy this networking need\n"
                         f"Query: {text}"
-                    )
-                payload: dict[str, Any] = {"model": self.embedding_model, "input": [embedding_input]}
+                    ) for text in texts]
+                payload: dict[str, Any] = {"model": self.embedding_model, "input": embedding_inputs}
                 dimension_name = "FIREWORKS_EMBEDDING_DIMENSIONS" if self.name == "Fireworks" else "OPENROUTER_EMBEDDING_DIMENSIONS"
                 if dimensions := env(dimension_name):
                     payload["dimensions"] = int(dimensions)
                 result = self._post(self.embedding_url, payload)
-                return normalize_vector([float(x) for x in result["data"][0]["embedding"]]), self.name
+                ordered = sorted(result["data"], key=lambda item: int(item.get("index", 0)))
+                vectors = [normalize_vector([float(x) for x in item["embedding"]]) for item in ordered]
+                if len(vectors) == len(texts):
+                    return vectors, self.name
             except (urllib.error.URLError, TimeoutError, KeyError, IndexError, TypeError, ValueError):
                 pass
         fallback_dimension_name = "FIREWORKS_EMBEDDING_DIMENSIONS" if self.name == "Fireworks" else "OPENROUTER_EMBEDDING_DIMENSIONS"
         fallback_dimensions = int(env(fallback_dimension_name) or "96")
-        return deterministic_embedding(text, fallback_dimensions), "Local deterministic"
+        return [deterministic_embedding(text, fallback_dimensions) for text in texts], "Local deterministic"
+
+    def embedding(self, text: str, purpose: str = "document") -> tuple[list[float], str]:
+        vectors, mode = self.embeddings([text], purpose)
+        return vectors[0], mode
 
 
 PROVIDER = Provider()
@@ -425,6 +434,15 @@ class MemoryBackend:
         with self.lock:
             memory = self.load_unlocked(); memory["actions"].append(receipt); self._write_local(memory)
 
+    def erase_all(self) -> None:
+        """Delete all stored relationship data for this self-hosted instance."""
+        if self.database is not None:
+            for collection in (self.database.people, self.database.conversations, self.database.memory_items, self.database.actions):
+                collection.delete_many({})
+            return
+        with self.lock:
+            self._write_local(self._empty())
+
     def vector_offers(self, query: list[float], exclude_person: str) -> list[dict[str, Any]]:
         if self.database is None or not env("MONGODB_VECTOR_INDEX"):
             return []
@@ -535,9 +553,25 @@ def match_tool(state: WorkflowState) -> WorkflowState:
     opportunities: list[dict[str, Any]] = []
     search_mode = "Local semantic"
     minimum = float(env("SECONDHELLO_MATCH_THRESHOLD", "0.18"))
+    need_texts = list(dict.fromkeys(
+        need for profile in profiles.values() for need in profile.get("needs", [])
+    ))
+    document_texts = list(dict.fromkeys(
+        [offer for profile in profiles.values() for offer in profile.get("offers", [])]
+        + [
+            str(candidate.get("supportedCapability", "")).strip() + " " + str(candidate.get("rationale", "")).strip()
+            for profile in profiles.values()
+            for candidate in profile.get("publicCandidates", [])
+            if str(candidate.get("supportedCapability", "")).strip()
+        ]
+    ))
+    need_vectors, embedding_mode = PROVIDER.embeddings(need_texts, "query")
+    document_vectors, _ = PROVIDER.embeddings(document_texts, "document")
+    query_embeddings = dict(zip(need_texts, need_vectors))
+    document_embeddings = dict(zip(document_texts, document_vectors))
     for recipient_id, recipient_profile in profiles.items():
         for need in recipient_profile.get("needs", []):
-            query, embedding_mode = PROVIDER.embedding(need, "query")
+            query = query_embeddings[need]
             atlas = BACKEND.vector_offers(query, recipient_id)
             if atlas:
                 candidates = [(float(item.get("score", 0)), item["personID"], item["text"], {"id": str(uuid4()), "quote": item.get("quote", item["text"]), "conversationID": item.get("conversationID", ""), "capturedAt": item.get("capturedAt", utc_now()), "sourceURL": item.get("sourceURL"), "sourceTitle": item.get("sourceTitle")}) for item in atlas]
@@ -547,7 +581,7 @@ def match_tool(state: WorkflowState) -> WorkflowState:
                 for connector_id, connector_profile in profiles.items():
                     if connector_id == recipient_id: continue
                     for offer in connector_profile.get("offers", []):
-                        offer_vector, _ = PROVIDER.embedding(offer, "document")
+                        offer_vector = document_embeddings[offer]
                         candidates.append((cosine(query, offer_vector), connector_id, offer, evidence_for(connector_profile, offer)))
             for score, connector_id, offer, offer_evidence in sorted(candidates, key=lambda item: item[0], reverse=True)[:1]:
                 if score < minimum or connector_id not in people or recipient_id not in people: continue
@@ -561,7 +595,8 @@ def match_tool(state: WorkflowState) -> WorkflowState:
                 source = candidate.get("source", {}) if isinstance(candidate.get("source"), dict) else {}
                 capability = str(candidate.get("supportedCapability", "")).strip()
                 if not capability or not source.get("url"): continue
-                candidate_vector, _ = PROVIDER.embedding(capability + " " + str(candidate.get("rationale", "")), "document")
+                candidate_text = capability + " " + str(candidate.get("rationale", "")).strip()
+                candidate_vector = document_embeddings[candidate_text]
                 score = cosine(query, candidate_vector)
                 if score < minimum: continue
                 candidate_id = str(uuid5(NAMESPACE_URL, str(source["url"]) + str(candidate.get("name", ""))))
@@ -668,6 +703,27 @@ def elevenlabs_signed_url() -> tuple[int, dict[str, Any]]:
         return 502, {"ok": False, "reason": "elevenlabs_signed_url_unavailable"}
 
 
+def elevenlabs_scribe_token() -> tuple[int, dict[str, Any]]:
+    """Mint a short-lived browser token for ElevenLabs Scribe realtime STT."""
+    api_key = env("ELEVENLABS_API_KEY")
+    if not api_key:
+        return 503, {"ok": False, "reason": "elevenlabs_api_key_required"}
+    request = urllib.request.Request(
+        "https://api.elevenlabs.io/v1/single-use-token/realtime_scribe",
+        headers={"xi-api-key": api_key, "Accept": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=float(env("PROVIDER_TIMEOUT_SECONDS", "12"))) as response:
+            payload = json.loads(response.read())
+        token = str(payload.get("token", "")).strip()
+        if not token:
+            return 502, {"ok": False, "reason": "elevenlabs_scribe_token_unavailable"}
+        return 200, {"ok": True, "token": token, "modelId": "scribe_v2_realtime"}
+    except (urllib.error.URLError, TimeoutError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return 502, {"ok": False, "reason": "elevenlabs_scribe_token_unavailable"}
+
+
 def send_json(handler: Any, status: int, payload: dict[str, Any]) -> None:
     body = json.dumps(payload, default=str).encode()
     handler.send_response(status); handler.send_header("Content-Type", "application/json"); handler.send_header("Content-Length", str(len(body))); handler.end_headers(); handler.wfile.write(body)
@@ -694,4 +750,8 @@ def serve(host: str = "127.0.0.1", port: int = 8765) -> None:
 
 
 if __name__ == "__main__":
-    serve(env("SECONDHELLO_HOST", "127.0.0.1"), int(env("SECONDHELLO_PORT", "8765")))
+    # Keep direct invocation safe and compatible while routing through the
+    # production HTTP boundary (auth, bounded requests, SSE, and static web).
+    from production_server import serve as production_serve
+
+    production_serve(env("SECONDHELLO_HOST", "127.0.0.1"), int(env("SECONDHELLO_PORT", "8765")))

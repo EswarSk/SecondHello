@@ -1,0 +1,14 @@
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+.venv
+.build
+__pycache__
+*.pyc
+web/node_modules
+web/dist
+node_modules
+README.md
+Tests

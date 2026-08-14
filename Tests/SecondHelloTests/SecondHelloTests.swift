@@ -58,6 +58,24 @@ final class SecondHelloTests: XCTestCase {
         XCTAssertNil(ElevenLabsAudioFormat.sampleRate(from: "ulaw_8000"))
     }
 
+    func testIdentityDetectorPrefersExplicitIntroductionOverConversationalPhrase() {
+        let transcript = "Okay, I'm just trying to find people working on agentic AI. And I am Peter. I work at Oscorep."
+        XCTAssertEqual(SpeakerIdentityDetector.detect(in: transcript), "Peter")
+    }
+
+    func testIdentityDetectorRejectsNonNamePredicates() {
+        XCTAssertNil(SpeakerIdentityDetector.detect(in: "I'm just trying to meet builders. I am looking for collaborators."))
+        XCTAssertEqual(SpeakerIdentityDetector.detect(in: "My name is peter parker, and I build sales tools."), "Peter Parker")
+        XCTAssertEqual(SpeakerIdentityDetector.detect(in: "Hey, this is Ray. I'm the head of marketing."), "Ray")
+        XCTAssertNil(SpeakerIdentityDetector.detect(in: "This is a platform for sales teams."))
+    }
+
+    func testHumanTranscriptKeepsCompleteSpeechAndRejectsAgentEchoes() {
+        XCTAssertEqual(HumanTranscript.preferred("My name is Ana", "My name is Ana and I build robots"), "My name is Ana and I build robots")
+        XCTAssertTrue(HumanTranscript.isLikelyAgentEcho("Listen quietly in the background.", agentResponse: "I’ll listen quietly in the background now."))
+        XCTAssertFalse(HumanTranscript.isLikelyAgentEcho("This is Ana and I need a robotics cofounder.", agentResponse: "I’ll listen quietly in the background now."))
+    }
+
     @MainActor
     func testVoiceAgentStartsWithoutCredentialsOrMicrophoneSideEffects() {
         let agent = ElevenLabsConversationService()

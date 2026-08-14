@@ -22,23 +22,7 @@ struct ContentView: View {
     @State private var captureConsent = false
     @State private var captureImporting = false
     @State private var captureStatus = ""
-
-    private func detectedName(in transcript: String) -> String? {
-        let lower = transcript.lowercased()
-        for lead in ["my name is ", "i'm ", "i am "] {
-            guard let range = lower.range(of: lead) else { continue }
-            let offset = lower.distance(from: lower.startIndex, to: range.upperBound)
-            let start = transcript.index(transcript.startIndex, offsetBy: offset)
-            let tail = transcript[start...]
-            let candidate = tail.split(whereSeparator: { ",.!?;\n".contains($0) }).first.map(String.init) ?? ""
-            let words = candidate.split(separator: " ").prefix(3).map(String.init)
-            guard !words.isEmpty else { continue }
-            let rejected = ["a", "an", "looking", "interested", "working", "seeking"]
-            guard !rejected.contains(words[0].lowercased()) else { continue }
-            return words.joined(separator: " ")
-        }
-        return nil
-    }
+    @State private var captureNameWasAutoDetected = false
 
     private func finishCaptureAndOpenOpportunities() {
         guard !store.isWorking else { return }
@@ -48,10 +32,12 @@ struct ContentView: View {
             try? await Task.sleep(for: .milliseconds(900))
             let liveTranscript = voiceAgent.transcript.trimmingCharacters(in: .whitespacesAndNewlines)
             let fallbackTranscript = listener.transcript.trimmingCharacters(in: .whitespacesAndNewlines)
-            let transcript = liveTranscript.isEmpty ? fallbackTranscript : liveTranscript
+            let transcript = HumanTranscript.preferred(liveTranscript, fallbackTranscript)
             listener.transcript = transcript
-            if captureName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                captureName = detectedName(in: transcript) ?? ""
+            if captureName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || captureNameWasAutoDetected,
+               let detected = SpeakerIdentityDetector.detect(in: transcript) {
+                captureName = detected
+                captureNameWasAutoDetected = true
             }
             listener.stop(); voiceAgent.stop()
 
@@ -121,6 +107,7 @@ struct ContentView: View {
                 consent: $captureConsent,
                 importing: $captureImporting,
                 status: $captureStatus,
+                nameWasAutoDetected: $captureNameWasAutoDetected,
                 listener: listener,
                 voiceAgent: voiceAgent,
                 onFinish: finishCaptureAndOpenOpportunities
@@ -199,6 +186,7 @@ struct CaptureView: View {
     @Binding var consent: Bool
     @Binding var importing: Bool
     @Binding var status: String
+    @Binding var nameWasAutoDetected: Bool
     @ObservedObject var listener: LiveListeningService
     @ObservedObject var voiceAgent: ElevenLabsConversationService
     let onFinish: () -> Void
@@ -222,6 +210,16 @@ struct CaptureView: View {
                 voiceAgent.transcript = listener.transcript
                 try await voiceAgent.start()
                 status = "Consent confirmed. Quiet background capture is active; say “Second Hello” when you want help."
+                Task { @MainActor in
+                    try? await Task.sleep(for: .seconds(8))
+                    guard voiceAgent.isActive,
+                          voiceAgent.transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+                    voiceAgent.stop()
+                    await listener.start()
+                    status = listener.isListening
+                        ? "ElevenLabs returned no transcript; Apple Speech backup is recording now."
+                        : "No transcript arrived. Check the selected microphone and try again."
+                }
             } catch {
                 voiceAgent.stop()
                 await listener.start()
@@ -232,22 +230,6 @@ struct CaptureView: View {
         }
     }
 
-    private func detectedName(in transcript: String) -> String? {
-        let lower = transcript.lowercased()
-        for lead in ["my name is ", "i'm ", "i am "] {
-            guard let range = lower.range(of: lead) else { continue }
-            let offset = lower.distance(from: lower.startIndex, to: range.upperBound)
-            let start = transcript.index(transcript.startIndex, offsetBy: offset)
-            let tail = transcript[start...]
-            let candidate = tail.split(whereSeparator: { ",.!?;\n".contains($0) }).first.map(String.init) ?? ""
-            let words = candidate.split(separator: " ").prefix(3).map(String.init)
-            guard !words.isEmpty else { continue }
-            let rejected = ["a", "an", "looking", "interested", "working", "seeking"]
-            guard !rejected.contains(words[0].lowercased()) else { continue }
-            return words.joined(separator: " ")
-        }
-        return nil
-    }
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
@@ -260,11 +242,20 @@ struct CaptureView: View {
                         Label("Demo event: \(scenario.event)", systemImage: "ticket").font(.subheadline.bold())
                         Spacer()
                         ForEach(scenario.guests) { guest in
-                            Button("Load \(guest.name.components(separatedBy: " ").first ?? guest.name)") { resetCapture(); name = guest.name; email = guest.email; listener.transcript = guest.transcript; consent = false; status = "Demo conversation loaded. Consent is intentionally still off." }.buttonStyle(.bordered)
+                            Button("Load \(guest.name.components(separatedBy: " ").first ?? guest.name)") { resetCapture(); name = guest.name; nameWasAutoDetected = false; email = guest.email; listener.transcript = guest.transcript; consent = false; status = "Demo conversation loaded. Consent is intentionally still off." }.buttonStyle(.bordered)
                         }
                     }.padding(12).background(.mint.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
                 }
-                HStack { TextField("Person’s name", text: $name); TextField("Email for a future draft (optional)", text: $email) }.textFieldStyle(.roundedBorder)
+                HStack {
+                    TextField("Person’s name", text: Binding(get: { name }, set: {
+                        name = $0
+                        nameWasAutoDetected = false
+                        if !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && status.contains("Say your name") {
+                            status = "Name confirmed. Ready to save the consented conversation."
+                        }
+                    }))
+                    TextField("Email for a future draft (optional)", text: $email)
+                }.textFieldStyle(.roundedBorder)
                 HStack(spacing: 14) {
                     Toggle(isOn: $consent) { VStack(alignment: .leading) { Text("They agreed to listening and public professional research").fontWeight(.semibold); Text("Stopping saves this conversation, verifies public professional sources, and finds evidence-backed opportunities.").font(.caption).foregroundStyle(.secondary) } }.toggleStyle(.switch)
                     Spacer()
@@ -283,6 +274,12 @@ struct CaptureView: View {
                         Text(voiceAgent.isAgentSpeaking ? "Second Hello is speaking" : (voiceAgent.isActive ? "Background capture active" : (isCapturing ? "Listening now" : "Live conversation capture"))).font(.title3.bold())
                         Text(activeStatus).foregroundStyle(.secondary)
                         Text(activeEngine).font(.caption).foregroundStyle(.tertiary)
+                        if isCapturing {
+                            Label(activeLevel > 0.015 ? "Microphone signal detected" : "Waiting for microphone signal…",
+                                  systemImage: activeLevel > 0.015 ? "waveform.circle.fill" : "mic.circle")
+                                .font(.caption.bold())
+                                .foregroundStyle(activeLevel > 0.015 ? Color.green : Color.orange)
+                        }
                         HStack {
                             if isCapturing {
                                 Button(store.isWorking ? "Finding opportunities…" : "Stop & find opportunities") { onFinish() }
@@ -315,7 +312,15 @@ struct CaptureView: View {
                     Spacer()
                     Button(store.isWorking ? "Running tools…" : "Remember with permission") {
                         stopCapture()
-                        Task { if await store.capture(name: name, email: email, transcript: listener.transcript, consented: consent) { status = "Memory saved. Looking for a meaningful connection…"; onSaved() } }
+                        status = "Saving consented memory and finding opportunities…"
+                        Task {
+                            if await store.capture(name: name, email: email, transcript: listener.transcript, consented: consent) {
+                                status = "Memory saved. Opportunities are ready."
+                                onSaved()
+                            } else {
+                                status = store.lastError ?? "The memory workflow could not complete."
+                            }
+                        }
                     }.buttonStyle(.borderedProminent).controlSize(.large).disabled(!consent || isCapturing || name.trimmingCharacters(in: .whitespaces).isEmpty || listener.transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || store.isWorking)
                 }
                 if !status.isEmpty { Label(status, systemImage: consent ? "checkmark.seal.fill" : "lock.fill").foregroundStyle(consent ? .green : .secondary) }
@@ -325,10 +330,11 @@ struct CaptureView: View {
             if !enabled && isCapturing { stopCapture(); status = "Listening stopped immediately because permission was withdrawn." }
         }.onChange(of: voiceAgent.transcript) { _, value in
             if !value.isEmpty {
-                listener.transcript = value
-                if name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                   let detected = detectedName(in: value) {
+                listener.transcript = HumanTranscript.preferred(value, listener.transcript)
+                if (name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || nameWasAutoDetected),
+                   let detected = SpeakerIdentityDetector.detect(in: value) {
                     name = detected
+                    nameWasAutoDetected = true
                     status = "Name detected from the live conversation. Continue speaking, then stop and review."
                 }
             }
@@ -487,6 +493,7 @@ struct DraftSheet: View {
 struct TrustCenterView: View {
     @EnvironmentObject private var store: MemoryStore
     @State private var serverURL = UserDefaults.standard.string(forKey: "serverURL") ?? ""
+    @State private var serverToken = UserDefaults.standard.string(forKey: "serverToken") ?? ""
     @State private var elevenLabsKey = Keychain.read(account: "elevenlabs-api-key") ?? ""
     @State private var saved = false
     var body: some View {
@@ -495,7 +502,8 @@ struct TrustCenterView: View {
                 LabeledContent("Status", value: store.workflowStatus)
                 Text(store.workflowDetail).foregroundStyle(.secondary)
                 TextField("Workflow server URL, e.g. http://127.0.0.1:8765", text: $serverURL)
-                Button("Save and test connection") { UserDefaults.standard.set(serverURL.trimmingCharacters(in: .whitespacesAndNewlines), forKey: "serverURL"); Task { await store.checkServer() } }
+                SecureField("Self-hosted bearer token (production mode)", text: $serverToken)
+                Button("Save and test connection") { UserDefaults.standard.set(serverURL.trimmingCharacters(in: .whitespacesAndNewlines), forKey: "serverURL"); UserDefaults.standard.set(serverToken.trimmingCharacters(in: .whitespacesAndNewlines), forKey: "serverToken"); Task { await store.checkServer() } }
             }
             Section("Realtime voice") {
                 LabeledContent("Private ElevenLabs agent", value: store.voiceAgentConfigured ? "Ready" : "Not configured")
