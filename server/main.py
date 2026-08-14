@@ -19,7 +19,7 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TypedDict
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 try:
     from langgraph.graph import END, START, StateGraph
@@ -99,6 +99,8 @@ class WorkflowState(TypedDict, total=False):
     action_receipt: dict[str, Any]
     memory: dict[str, Any]
     profile: dict[str, Any]
+    research_query: str
+    research: dict[str, Any]
     opportunities: list[dict[str, Any]]
     draft: dict[str, str]
     route: str
@@ -149,14 +151,14 @@ class Provider:
     def configured(self) -> bool:
         return bool(self.key and self.model)
 
-    def _post(self, url: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def _post(self, url: str, payload: dict[str, Any], timeout: float | None = None) -> dict[str, Any]:
         request = urllib.request.Request(
             url,
             data=json.dumps(payload).encode(),
             headers={"Authorization": f"Bearer {self.key}", "Content-Type": "application/json", "X-Title": "Second Hello"},
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=float(env("PROVIDER_TIMEOUT_SECONDS", "12"))) as response:
+        with urllib.request.urlopen(request, timeout=timeout or float(env("PROVIDER_TIMEOUT_SECONDS", "12"))) as response:
             return json.loads(response.read())
 
     def json_completion(self, system: str, user: str) -> dict[str, Any] | None:
@@ -175,6 +177,77 @@ class Provider:
             return json.loads(content)
         except (urllib.error.URLError, TimeoutError, KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError):
             return None
+
+    def public_research(self, query: str) -> tuple[dict[str, Any], str]:
+        """Research public professional facts with citations; never guess identity."""
+        if self.name != "OpenRouter" or not self.configured or env("SECONDHELLO_PUBLIC_RESEARCH", "1") == "0":
+            return {}, "Public research unavailable"
+        system = (
+            "You are an identity-safe professional networking researcher. Use web search. "
+            "Resolve the person only when the name and supplied professional context agree. "
+            "Do not collect sensitive traits, personal addresses, phone numbers, family details, or private data. "
+            "Return strict JSON with: matched (boolean), confidence (0..1), summary (string), "
+            "roles (array of concise public professional roles), offers (array of capabilities this person could plausibly offer), "
+            "sources (array of {title,url,quote}), and candidateConnections (array of at most 3 objects with "
+            "name, role, rationale, supportedCapability, and source {title,url,quote}). Candidate connections must directly address "
+            "an explicit need in the supplied context and be public professionals discoverable in authoritative sources. "
+            "Every role, offer, and candidate must be supported by a source. Do not return contact information. "
+            "If identity is ambiguous, set matched=false and return no roles or offers."
+        )
+        try:
+            result = self._post(self.chat_url, {
+                "model": self.model,
+                "temperature": 0,
+                "tools": [{"type": "openrouter:web_search", "parameters": {
+                    "engine": env("OPENROUTER_SEARCH_ENGINE", "auto"),
+                    "max_results": int(env("OPENROUTER_SEARCH_RESULTS", "6")),
+                    "max_total_results": int(env("OPENROUTER_SEARCH_TOTAL_RESULTS", "10")),
+                    "max_uses": int(env("OPENROUTER_SEARCH_MAX_USES", "3")),
+                    "search_context_size": env("OPENROUTER_SEARCH_CONTEXT_SIZE", "medium"),
+                }}],
+                "max_tool_calls": int(env("OPENROUTER_SEARCH_MAX_USES", "3")),
+                "messages": [{"role": "system", "content": system}, {"role": "user", "content": query}],
+            }, timeout=float(env("PUBLIC_RESEARCH_TIMEOUT_SECONDS", "35")))
+            message = result["choices"][0]["message"]
+            content = message["content"]
+            if isinstance(content, str) and content.startswith("```"):
+                content = re.sub(r"^```(?:json)?|```$", "", content.strip(), flags=re.I).strip()
+            parsed = json.loads(content)
+            citations: dict[str, dict[str, str]] = {}
+            for annotation in message.get("annotations", []):
+                citation = annotation.get("url_citation", annotation)
+                url = str(citation.get("url", "")).strip()
+                if url.startswith(("https://", "http://")):
+                    citations[url] = {"url": url, "title": str(citation.get("title", "Public source")), "quote": str(citation.get("content", ""))[:500]}
+            sources = []
+            for source in parsed.get("sources", []) if isinstance(parsed.get("sources"), list) else []:
+                if not isinstance(source, dict): continue
+                url = str(source.get("url", "")).strip()
+                if not url.startswith(("https://", "http://")): continue
+                cited = citations.get(url, {})
+                sources.append({"url": url, "title": str(source.get("title") or cited.get("title") or "Public source"), "quote": str(source.get("quote") or cited.get("quote") or "")[:500]})
+            for url, citation in citations.items():
+                if not any(item["url"] == url for item in sources): sources.append(citation)
+            parsed["sources"] = sources
+            candidates = []
+            for candidate in parsed.get("candidateConnections", []) if isinstance(parsed.get("candidateConnections"), list) else []:
+                if not isinstance(candidate, dict): continue
+                source = candidate.get("source", {}) if isinstance(candidate.get("source"), dict) else {}
+                url = str(source.get("url", "")).strip()
+                if not url.startswith(("https://", "http://")): continue
+                cited = citations.get(url, {})
+                name = str(candidate.get("name", "")).strip()
+                capability = str(candidate.get("supportedCapability", "")).strip()
+                if not (name and capability): continue
+                candidates.append({
+                    "name": name, "role": str(candidate.get("role", "")).strip(),
+                    "rationale": str(candidate.get("rationale", "")).strip(), "supportedCapability": capability,
+                    "source": {"url": url, "title": str(source.get("title") or cited.get("title") or "Public source"), "quote": str(source.get("quote") or cited.get("quote") or "")[:500]},
+                })
+            parsed["candidateConnections"] = candidates[:3]
+            return parsed, "OpenRouter Web Search"
+        except (urllib.error.URLError, TimeoutError, KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError):
+            return {}, "Public research unavailable"
 
     def embedding(self, text: str, purpose: str = "document") -> tuple[list[float], str]:
         if self.configured and self.embedding_model:
@@ -328,6 +401,11 @@ class MemoryBackend:
                     vector, embedding_mode = PROVIDER.embedding(text, "document")
                     quote = next((e.get("quote", "") for e in evidence if text.lower() in e.get("quote", "").lower()), text)
                     items.append({"personID": person["id"], "personName": person["name"], "conversationID": conversation["id"], "kind": kind[:-1] if kind.endswith("s") else kind, "text": text, "quote": quote, "embedding": vector, "embeddingMode": embedding_mode, "capturedAt": conversation["timestamp"]})
+            research_evidence = conversation.get("profile", {}).get("researchEvidence", []) or []
+            for text in conversation.get("profile", {}).get("publicOffers", []) or []:
+                vector, embedding_mode = PROVIDER.embedding(text, "document")
+                source = next((item for item in research_evidence if item.get("sourceURL")), research_evidence[0] if research_evidence else {})
+                items.append({"personID": person["id"], "personName": person["name"], "conversationID": conversation["id"], "kind": "public_offer", "text": text, "quote": source.get("quote", text), "sourceURL": source.get("sourceURL"), "sourceTitle": source.get("sourceTitle"), "embedding": vector, "embeddingMode": embedding_mode, "capturedAt": conversation["timestamp"]})
             if items:
                 self.database.memory_items.insert_many(items)
             return
@@ -351,7 +429,7 @@ class MemoryBackend:
         if self.database is None or not env("MONGODB_VECTOR_INDEX"):
             return []
         try:
-            pipeline = [{"$vectorSearch": {"index": env("MONGODB_VECTOR_INDEX"), "path": "embedding", "queryVector": query, "numCandidates": 100, "limit": 10}}, {"$match": {"kind": "offer", "personID": {"$ne": exclude_person}}}, {"$set": {"score": {"$meta": "vectorSearchScore"}}}, {"$project": {"_id": 0, "embedding": 0}}]
+            pipeline = [{"$vectorSearch": {"index": env("MONGODB_VECTOR_INDEX"), "path": "embedding", "queryVector": query, "numCandidates": 100, "limit": 10}}, {"$match": {"kind": {"$in": ["offer", "public_offer"]}, "personID": {"$ne": exclude_person}}}, {"$set": {"score": {"$meta": "vectorSearchScore"}}}, {"$project": {"_id": 0, "embedding": 0}}]
             return list(self.database.memory_items.aggregate(pipeline))
         except Exception:
             return []
@@ -377,23 +455,72 @@ def validate_and_route(state: WorkflowState) -> WorkflowState:
 def extract_tool(state: WorkflowState) -> WorkflowState:
     conversation = state["conversation"]
     profile, mode = extract_profile(conversation["transcript"], conversation["id"])
-    return {"profile": profile, "route": "persist", "trace": trace(state, "extract_memory", f"Extracted {sum(len(profile[key]) for key in ('needs', 'offers', 'topics', 'commitments'))} explicit memories", mode)}
+    return {"profile": profile, "route": "plan_research", "trace": trace(state, "extract_memory", f"Extracted {sum(len(profile[key]) for key in ('needs', 'offers', 'topics', 'commitments'))} explicit memories", mode)}
+
+
+def plan_research_tool(state: WorkflowState) -> WorkflowState:
+    person = state["person"]
+    profile = state["profile"]
+    context = "; ".join((profile.get("needs", []) + profile.get("offers", []) + profile.get("topics", []))[:6])
+    query = f'Research the public professional identity of "{person["name"]}". Professional context from a consented conversation: {context or state["conversation"]["transcript"][:500]}'
+    enabled = PROVIDER.name == "OpenRouter" and env("SECONDHELLO_PUBLIC_RESEARCH", "1") != "0"
+    detail = "Prepared a bounded identity-resolution query from name and professional context" if enabled else "Public research provider is unavailable; preserved the offline path"
+    return {"research_query": query, "route": "research", "trace": trace(state, "plan_public_research", detail, PROVIDER.name)}
+
+
+def research_tool(state: WorkflowState) -> WorkflowState:
+    research, mode = PROVIDER.public_research(state.get("research_query", ""))
+    source_count = len(research.get("sources", [])) if isinstance(research.get("sources"), list) else 0
+    detail = f"Resolved public professional context with {source_count} cited source(s)" if research.get("matched") else "No unambiguous cited public identity was found"
+    return {"research": research, "route": "verify_research", "trace": trace(state, "web_research", detail, mode)}
+
+
+def verify_research_tool(state: WorkflowState) -> WorkflowState:
+    research = state.get("research", {})
+    profile = dict(state["profile"])
+    sources = research.get("sources", []) if isinstance(research.get("sources"), list) else []
+    confidence = float(research.get("confidence", 0) or 0)
+    accepted_identity = bool(research.get("matched")) and confidence >= float(env("PUBLIC_RESEARCH_MIN_CONFIDENCE", "0.72")) and bool(sources)
+    cited_candidates = [candidate for candidate in research.get("candidateConnections", []) if isinstance(candidate, dict) and isinstance(candidate.get("source"), dict) and candidate["source"].get("url")]
+    if accepted_identity:
+        evidence = [{"id": str(uuid4()), "quote": str(item.get("quote") or item.get("title") or "Public professional source"), "conversationID": state["conversation"]["id"], "capturedAt": utc_now(), "sourceURL": item.get("url"), "sourceTitle": item.get("title")} for item in sources]
+        profile["publicSummary"] = str(research.get("summary", "")).strip() or None
+        profile["publicRoles"] = [str(value).strip() for value in research.get("roles", []) if str(value).strip()][:6]
+        profile["publicOffers"] = [str(value).strip() for value in research.get("offers", []) if str(value).strip()][:8]
+        profile["researchEvidence"] = evidence
+        identity_detail = f"accepted identity at {confidence:.0%} confidence"
+    else:
+        profile["publicSummary"] = None; profile["publicRoles"] = []; profile["publicOffers"] = []; profile["researchEvidence"] = []
+        identity_detail = "rejected ambiguous identity enrichment"
+    profile["publicCandidates"] = cited_candidates[:3]
+    detail = f"{identity_detail}; accepted {len(profile['publicCandidates'])} independently cited opportunity candidate(s)"
+    return {"profile": profile, "route": "persist", "trace": trace(state, "verify_sources", detail, "evidence policy")}
 
 
 def persist_tool(state: WorkflowState) -> WorkflowState:
     conversation = dict(state["conversation"]); conversation["profile"] = state["profile"]
-    BACKEND.persist_capture(state["person"], conversation)
+    person = dict(state["person"])
+    if state["profile"].get("publicSummary"):
+        person["publicSummary"] = state["profile"]["publicSummary"]
+        person["publicRoles"] = state["profile"].get("publicRoles", [])
+        person["researchSources"] = [{"url": item.get("sourceURL"), "title": item.get("sourceTitle")} for item in state["profile"].get("researchEvidence", [])]
+    BACKEND.persist_capture(person, conversation)
     return {"conversation": conversation, "route": "match", "trace": trace(state, "persist_memory", "Stored consent receipt, evidence, and structured memory", BACKEND.mode)}
 
 
 def profile_map(memory: dict[str, Any]) -> dict[str, dict[str, Any]]:
     profiles: dict[str, dict[str, Any]] = {}
     for conversation in memory.get("conversations", []):
-        current = profiles.setdefault(conversation.get("personID", ""), {"needs": [], "offers": [], "evidence": []})
+        current = profiles.setdefault(conversation.get("personID", ""), {"needs": [], "offers": [], "evidence": [], "publicCandidates": []})
         profile = conversation.get("profile", {})
         for key in ("needs", "offers"):
             current[key].extend(value for value in profile.get(key, []) if value not in current[key])
         current["evidence"].extend(profile.get("evidence", []))
+        for offer in profile.get("publicOffers", []) or []:
+            if offer not in current["offers"]: current["offers"].append(offer)
+        current["evidence"].extend(profile.get("researchEvidence", []) or [])
+        for candidate in profile.get("publicCandidates", []) or []:
+            if candidate not in current["publicCandidates"]: current["publicCandidates"].append(candidate)
     return profiles
 
 
@@ -413,7 +540,7 @@ def match_tool(state: WorkflowState) -> WorkflowState:
             query, embedding_mode = PROVIDER.embedding(need, "query")
             atlas = BACKEND.vector_offers(query, recipient_id)
             if atlas:
-                candidates = [(float(item.get("score", 0)), item["personID"], item["text"], item.get("quote", item["text"])) for item in atlas]
+                candidates = [(float(item.get("score", 0)), item["personID"], item["text"], {"id": str(uuid4()), "quote": item.get("quote", item["text"]), "conversationID": item.get("conversationID", ""), "capturedAt": item.get("capturedAt", utc_now()), "sourceURL": item.get("sourceURL"), "sourceTitle": item.get("sourceTitle")}) for item in atlas]
                 search_mode = "Atlas Vector Search"
             else:
                 candidates = []
@@ -421,21 +548,41 @@ def match_tool(state: WorkflowState) -> WorkflowState:
                     if connector_id == recipient_id: continue
                     for offer in connector_profile.get("offers", []):
                         offer_vector, _ = PROVIDER.embedding(offer, "document")
-                        candidates.append((cosine(query, offer_vector), connector_id, offer, evidence_for(connector_profile, offer)["quote"]))
-            for score, connector_id, offer, offer_quote in sorted(candidates, reverse=True)[:1]:
+                        candidates.append((cosine(query, offer_vector), connector_id, offer, evidence_for(connector_profile, offer)))
+            for score, connector_id, offer, offer_evidence in sorted(candidates, key=lambda item: item[0], reverse=True)[:1]:
                 if score < minimum or connector_id not in people or recipient_id not in people: continue
                 opportunities.append({
                     "id": str(uuid4()), "recipientID": recipient_id, "recipientName": people[recipient_id]["name"], "recipientEmail": people[recipient_id].get("email"),
                     "connectorID": connector_id, "connectorName": people[connector_id]["name"], "connectorEmail": people[connector_id].get("email"),
                     "need": need, "offer": offer, "score": round(score, 3), "needEvidence": evidence_for(recipient_profile, need),
-                    "offerEvidence": {"id": str(uuid4()), "quote": offer_quote, "conversationID": "", "capturedAt": utc_now()}, "searchMode": search_mode,
+                    "offerEvidence": offer_evidence, "searchMode": search_mode + (" + cited public research" if offer_evidence.get("sourceURL") else ""),
                 })
+            for candidate in recipient_profile.get("publicCandidates", []):
+                source = candidate.get("source", {}) if isinstance(candidate.get("source"), dict) else {}
+                capability = str(candidate.get("supportedCapability", "")).strip()
+                if not capability or not source.get("url"): continue
+                candidate_vector, _ = PROVIDER.embedding(capability + " " + str(candidate.get("rationale", "")), "document")
+                score = cosine(query, candidate_vector)
+                if score < minimum: continue
+                candidate_id = str(uuid5(NAMESPACE_URL, str(source["url"]) + str(candidate.get("name", ""))))
+                opportunities.append({
+                    "id": str(uuid5(NAMESPACE_URL, recipient_id + candidate_id + need)),
+                    "recipientID": recipient_id, "recipientName": people[recipient_id]["name"], "recipientEmail": people[recipient_id].get("email"),
+                    "connectorID": candidate_id, "connectorName": str(candidate.get("name", "Public candidate")), "connectorEmail": None,
+                    "need": need, "offer": capability, "score": round(score, 3), "needEvidence": evidence_for(recipient_profile, need),
+                    "offerEvidence": {"id": str(uuid4()), "quote": str(source.get("quote") or candidate.get("rationale") or capability), "conversationID": "", "capturedAt": utc_now(), "sourceURL": source.get("url"), "sourceTitle": source.get("title")},
+                    "searchMode": "OpenRouter Web Search · public candidate",
+                })
+    return {"memory": memory, "opportunities": opportunities, "route": "rank", "trace": trace(state, "find_introductions", f"Compared explicit needs against transcript and cited public capability signals; found {len(opportunities)} candidate(s)", search_mode)}
+
+
+def rank_tool(state: WorkflowState) -> WorkflowState:
     unique: dict[tuple[str, str], dict[str, Any]] = {}
-    for opportunity in opportunities:
+    for opportunity in state.get("opportunities", []):
         key = (opportunity["recipientID"], opportunity["connectorID"])
         if key not in unique or opportunity["score"] > unique[key]["score"]: unique[key] = opportunity
     values = sorted(unique.values(), key=lambda item: item["score"], reverse=True)
-    return {"memory": memory, "opportunities": values, "route": "end", "trace": trace(state, "find_introductions", f"Compared consented needs and offers; found {len(values)} opportunity(s)", search_mode)}
+    return {"opportunities": values, "route": "end", "trace": trace(state, "rank_opportunities", f"Deduplicated and ranked {len(values)} evidence-backed opportunity(s)", "deterministic policy")}
 
 
 def draft_tool(state: WorkflowState) -> WorkflowState:
@@ -465,7 +612,7 @@ def response(state: WorkflowState) -> dict[str, Any]:
 def run_local(initial: WorkflowState) -> WorkflowState:
     state = dict(initial); state.update(validate_and_route(state))
     while state.get("route") != "end":
-        node = {"extract": extract_tool, "persist": persist_tool, "match": match_tool, "draft": draft_tool, "record_action": record_action_tool}[state["route"]]
+        node = {"extract": extract_tool, "plan_research": plan_research_tool, "research": research_tool, "verify_research": verify_research_tool, "persist": persist_tool, "match": match_tool, "rank": rank_tool, "draft": draft_tool, "record_action": record_action_tool}[state["route"]]
         state.update(node(state))
     return state
 
@@ -473,10 +620,10 @@ def run_local(initial: WorkflowState) -> WorkflowState:
 def build_graph():
     if StateGraph is None: return None
     graph = StateGraph(WorkflowState)
-    graph.add_node("guard", validate_and_route); graph.add_node("extract", extract_tool); graph.add_node("persist", persist_tool); graph.add_node("match", match_tool); graph.add_node("draft", draft_tool); graph.add_node("record_action", record_action_tool)
+    graph.add_node("guard", validate_and_route); graph.add_node("extract", extract_tool); graph.add_node("plan_research", plan_research_tool); graph.add_node("research", research_tool); graph.add_node("verify_research", verify_research_tool); graph.add_node("persist", persist_tool); graph.add_node("match", match_tool); graph.add_node("rank", rank_tool); graph.add_node("draft", draft_tool); graph.add_node("record_action", record_action_tool)
     graph.add_edge(START, "guard")
     graph.add_conditional_edges("guard", lambda state: state.get("route", "end"), {"extract": "extract", "match": "match", "draft": "draft", "record_action": "record_action", "end": END})
-    graph.add_edge("extract", "persist"); graph.add_edge("persist", "match"); graph.add_edge("match", END); graph.add_edge("draft", END); graph.add_edge("record_action", END)
+    graph.add_edge("extract", "plan_research"); graph.add_edge("plan_research", "research"); graph.add_edge("research", "verify_research"); graph.add_edge("verify_research", "persist"); graph.add_edge("persist", "match"); graph.add_edge("match", "rank"); graph.add_edge("rank", END); graph.add_edge("draft", END); graph.add_edge("record_action", END)
     return graph.compile()
 
 
@@ -496,6 +643,7 @@ def health() -> dict[str, Any]:
         "storage": BACKEND.mode,
         "provider": PROVIDER.name,
         "vectorSearch": bool(BACKEND.database is not None and env("MONGODB_VECTOR_INDEX")),
+        "publicResearch": PROVIDER.name == "OpenRouter" and env("SECONDHELLO_PUBLIC_RESEARCH", "1") != "0",
         "voiceAgentConfigured": bool(env("ELEVENLABS_API_KEY") and env("ELEVENLABS_AGENT_ID")),
         "safeFallback": True,
     }

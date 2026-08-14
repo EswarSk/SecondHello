@@ -49,7 +49,7 @@ enum WorkflowClient {
         guard let baseURL else { throw WorkflowError.notConfigured }
         var request = URLRequest(url: baseURL.appendingPathComponent("workflow"))
         // Extraction + embeddings can exceed 15 seconds on a cold provider call.
-        request.timeoutInterval = 45
+        request.timeoutInterval = 90
         request.httpMethod = "POST"; request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         var payload: [String: Any] = ["action": action]
         values.forEach { payload[$0.key] = $0.value }

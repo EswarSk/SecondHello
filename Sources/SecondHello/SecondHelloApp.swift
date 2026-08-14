@@ -266,7 +266,7 @@ struct CaptureView: View {
                 }
                 HStack { TextField("Person’s name", text: $name); TextField("Email for a future draft (optional)", text: $email) }.textFieldStyle(.roundedBorder)
                 HStack(spacing: 14) {
-                    Toggle(isOn: $consent) { VStack(alignment: .leading) { Text("They explicitly agreed to live listening").fontWeight(.semibold); Text("Unlocks the microphone. Stopping publishes only this consented memory and its matched opportunities.").font(.caption).foregroundStyle(.secondary) } }.toggleStyle(.switch)
+                    Toggle(isOn: $consent) { VStack(alignment: .leading) { Text("They agreed to listening and public professional research").fontWeight(.semibold); Text("Stopping saves this conversation, verifies public professional sources, and finds evidence-backed opportunities.").font(.caption).foregroundStyle(.secondary) } }.toggleStyle(.switch)
                     Spacer()
                     Label(consent ? "Permission active" : "Microphone locked", systemImage: consent ? "checkmark.shield.fill" : "lock.fill").font(.caption.bold()).foregroundStyle(consent ? Color.green : Color.secondary)
                 }.padding(14).background(consent ? .green.opacity(0.09) : .secondary.opacity(0.07), in: RoundedRectangle(cornerRadius: 12))
@@ -364,7 +364,7 @@ struct OpportunitiesView: View {
         let ideas = store.introductions()
         VStack(alignment: .leading, spacing: 18) {
             HStack(alignment: .bottom) {
-                VStack(alignment: .leading, spacing: 5) { Text("Connections worth making").font(.largeTitle.bold()); Text("Ranked from consented needs and offers. Every claim opens back to its source.").foregroundStyle(.secondary) }
+                VStack(alignment: .leading, spacing: 5) { Text("Connections worth making").font(.largeTitle.bold()); Text("Ranked from consented memory and verified public professional evidence. Every public claim links to its source.").foregroundStyle(.secondary) }
                 Spacer(); Button { Task { await store.refreshOpportunities() } } label: { Label("Refresh", systemImage: "arrow.clockwise") }.buttonStyle(.bordered)
             }
             if ideas.isEmpty {
@@ -374,7 +374,12 @@ struct OpportunitiesView: View {
                     VStack(alignment: .leading, spacing: 12) {
                         HStack {
                             VStack(alignment: .leading, spacing: 4) { Text("\(idea.recipient.name) × \(idea.connector.name)").font(.title3.bold()); Label("\(Int(idea.score * 100))% semantic fit · \(idea.searchMode)", systemImage: "scope").font(.caption).foregroundStyle(.mint) }
-                            Spacer(); Button("Show evidence") { evidence = idea }.buttonStyle(.bordered); Button("Prepare introduction") { drafting = idea }.buttonStyle(.borderedProminent)
+                            Spacer(); Button("Show evidence") { evidence = idea }.buttonStyle(.bordered)
+                            if idea.searchMode.contains("public candidate") {
+                                Label("Research lead · no outreach", systemImage: "globe").font(.caption).foregroundStyle(.secondary)
+                            } else {
+                                Button("Prepare introduction") { drafting = idea }.buttonStyle(.borderedProminent)
+                            }
                         }
                         HStack(alignment: .top, spacing: 16) {
                             EvidencePreview(label: "NEEDS", person: idea.recipient.name, value: idea.complementaryNeed)
@@ -423,6 +428,9 @@ struct PeopleView: View {
                     HStack { Text(person.name).font(.title3.bold()); if let email = person.email { Text(email).font(.caption).foregroundStyle(.secondary) }; Spacer(); Label("Consented", systemImage: "checkmark.shield.fill").font(.caption).foregroundStyle(.green) }
                     if !profile.needs.isEmpty { LabeledContent("Needs", value: profile.needs.joined(separator: " · ")) }
                     if !profile.offers.isEmpty { LabeledContent("Offers", value: profile.offers.joined(separator: " · ")) }
+                    if let summary = profile.publicSummary, !summary.isEmpty { LabeledContent("Public research", value: summary) }
+                    if let roles = profile.publicRoles, !roles.isEmpty { LabeledContent("Verified roles", value: roles.joined(separator: " · ")) }
+                    if let offers = profile.publicOffers, !offers.isEmpty { LabeledContent("Cited capabilities", value: offers.joined(separator: " · ")) }
                     if !profile.commitments.isEmpty { LabeledContent("Commitments", value: profile.commitments.joined(separator: " · ")) }
                     Text("\(profile.evidence.count) source excerpts retained for explainability").font(.caption).foregroundStyle(.secondary)
                 }.padding(.vertical, 8)
@@ -438,7 +446,14 @@ struct WhySheet: View {
         VStack(alignment: .leading, spacing: 18) {
             HStack { VStack(alignment: .leading) { Text("Why these two?").font(.title.bold()); Text("Evidence, not an AI hunch").foregroundStyle(.secondary) }; Spacer(); Text("\(Int(idea.score * 100))% fit").font(.headline).foregroundStyle(.mint) }
             GroupBox("\(idea.recipient.name) · stated need") { Text("“\(idea.needEvidence.quote)”").frame(maxWidth: .infinity, alignment: .leading).padding(.vertical, 4) }
-            GroupBox("\(idea.connector.name) · stated offer") { Text("“\(idea.offerEvidence.quote)”").frame(maxWidth: .infinity, alignment: .leading).padding(.vertical, 4) }
+            GroupBox("\(idea.connector.name) · supporting evidence") {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("“\(idea.offerEvidence.quote)”")
+                    if let rawURL = idea.offerEvidence.sourceURL, let url = URL(string: rawURL) {
+                        Link(idea.offerEvidence.sourceTitle ?? "Open public source", destination: url)
+                    }
+                }.frame(maxWidth: .infinity, alignment: .leading).padding(.vertical, 4)
+            }
             Label("\(idea.searchMode) ranked the match. No external action has been taken.", systemImage: "lock.fill").foregroundStyle(.green)
             HStack { Spacer(); Button("Close") { dismiss() }.keyboardShortcut(.defaultAction) }
         }.padding(28).frame(width: 620)
@@ -495,6 +510,7 @@ struct TrustCenterView: View {
             }
             Section("Consent contract") {
                 Label("No extraction or persistence before consent", systemImage: "checkmark.circle.fill")
+                Label("Public research requires consent and cited identity evidence", systemImage: "checkmark.circle.fill")
                 Label("No introduction without source evidence", systemImage: "checkmark.circle.fill")
                 Label("No message is ever sent automatically", systemImage: "checkmark.circle.fill")
             }

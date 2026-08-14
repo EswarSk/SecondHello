@@ -16,6 +16,8 @@ struct Evidence: Codable, Identifiable, Hashable {
     var quote: String
     var conversationID: UUID
     var capturedAt: Date
+    var sourceURL: String? = nil
+    var sourceTitle: String? = nil
 }
 
 struct Profile: Codable, Hashable {
@@ -24,6 +26,10 @@ struct Profile: Codable, Hashable {
     var topics: [String] = []
     var commitments: [String] = []
     var evidence: [Evidence] = []
+    var publicSummary: String? = nil
+    var publicRoles: [String]? = nil
+    var publicOffers: [String]? = nil
+    var researchEvidence: [Evidence]? = nil
 }
 
 struct Conversation: Codable, Identifiable, Hashable {
@@ -73,7 +79,13 @@ struct IntroductionDraft: Codable, Hashable {
     var body: String
 }
 
-struct ServerEvidence: Codable, Hashable { var quote: String }
+struct ServerEvidence: Codable, Hashable {
+    var quote: String
+    var conversationID: String? = nil
+    var capturedAt: String? = nil
+    var sourceURL: String? = nil
+    var sourceTitle: String? = nil
+}
 
 struct ServerOpportunity: Codable, Identifiable, Hashable {
     var id: UUID

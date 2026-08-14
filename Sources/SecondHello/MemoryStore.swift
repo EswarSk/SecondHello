@@ -118,7 +118,17 @@ final class MemoryStore: ObservableObject {
 
     func profile(for person: Person) -> Profile {
         memory.conversations.filter { $0.personID == person.id }.reduce(Profile()) { partial, conversation in
-            Profile(needs: (partial.needs + conversation.profile.needs).uniqued(), offers: (partial.offers + conversation.profile.offers).uniqued(), topics: (partial.topics + conversation.profile.topics).uniqued(), commitments: (partial.commitments + conversation.profile.commitments).uniqued(), evidence: partial.evidence + conversation.profile.evidence)
+            Profile(
+                needs: (partial.needs + conversation.profile.needs).uniqued(),
+                offers: (partial.offers + conversation.profile.offers).uniqued(),
+                topics: (partial.topics + conversation.profile.topics).uniqued(),
+                commitments: (partial.commitments + conversation.profile.commitments).uniqued(),
+                evidence: partial.evidence + conversation.profile.evidence,
+                publicSummary: conversation.profile.publicSummary ?? partial.publicSummary,
+                publicRoles: ((partial.publicRoles ?? []) + (conversation.profile.publicRoles ?? [])).uniqued(),
+                publicOffers: ((partial.publicOffers ?? []) + (conversation.profile.publicOffers ?? [])).uniqued(),
+                researchEvidence: (partial.researchEvidence ?? []) + (conversation.profile.researchEvidence ?? [])
+            )
         }
     }
 
@@ -175,10 +185,17 @@ final class MemoryStore: ObservableObject {
     }
 
     private func mapOpportunity(_ value: ServerOpportunity) -> Introduction? {
-        guard let recipient = memory.people.first(where: { $0.id == value.recipientID }), let connector = memory.people.first(where: { $0.id == value.connectorID }) else { return nil }
+        guard let recipient = memory.people.first(where: { $0.id == value.recipientID }) else { return nil }
+        let connector = memory.people.first(where: { $0.id == value.connectorID }) ?? Person(id: value.connectorID, name: value.connectorName, email: value.connectorEmail, createdAt: .now)
         let recipientProfile = profile(for: recipient), connectorProfile = profile(for: connector)
-        guard let needEvidence = evidence(for: value.need, in: recipientProfile), let offerEvidence = evidence(for: value.offer, in: connectorProfile) else { return nil }
+        let needEvidence = evidence(for: value.need, in: recipientProfile) ?? evidence(from: value.needEvidence)
+        let offerEvidence = value.offerEvidence.sourceURL == nil ? (evidence(for: value.offer, in: connectorProfile) ?? evidence(from: value.offerEvidence)) : evidence(from: value.offerEvidence)
         return Introduction(id: value.id, recipient: recipient, connector: connector, complementaryNeed: value.need, complementaryOffer: value.offer, needEvidence: needEvidence, offerEvidence: offerEvidence, score: value.score, searchMode: value.searchMode)
+    }
+
+    private func evidence(from value: ServerEvidence) -> Evidence {
+        let captured = value.capturedAt.flatMap { ISO8601DateFormatter().date(from: $0) } ?? .now
+        return Evidence(quote: value.quote, conversationID: value.conversationID.flatMap(UUID.init(uuidString:)) ?? UUID(), capturedAt: captured, sourceURL: value.sourceURL, sourceTitle: value.sourceTitle)
     }
 
     func draft(for idea: Introduction) async -> IntroductionDraft {

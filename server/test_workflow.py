@@ -40,8 +40,27 @@ class WorkflowTests(unittest.TestCase):
     def test_capture_calls_extract_persist_and_match_tools(self):
         result = self.capture("p1", "Alex", "alex@example.com", "I need an applied ML partner. I can offer climate domain expertise.")
         self.assertTrue(result["ok"])
-        self.assertEqual([item["tool"] for item in result["trace"]], ["consent_gate", "extract_memory", "persist_memory", "find_introductions"])
+        self.assertEqual([item["tool"] for item in result["trace"]], ["consent_gate", "extract_memory", "plan_public_research", "web_research", "verify_sources", "persist_memory", "find_introductions", "rank_opportunities"])
         self.assertEqual(main.BACKEND.load()["people"][0]["name"], "Alex")
+
+    def test_openrouter_research_requires_citations_before_enrichment(self):
+        os.environ["OPENROUTER_API_KEY"] = "configured-for-test"
+        os.environ["OPENROUTER_MODEL"] = "openrouter-test-model"
+        os.environ["SECONDHELLO_PROVIDER"] = "openrouter"
+        main.PROVIDER = main.Provider()
+        main.PROVIDER.embedding_model = ""
+        response = {"choices": [{"message": {
+            "content": '{"matched":true,"confidence":0.91,"summary":"Climate software founder","roles":["Founder"],"offers":["climate domain expertise"],"sources":[{"title":"Profile","url":"https://example.com/alex","quote":"Alex builds climate software."}],"candidateConnections":[{"name":"Jordan Research","role":"ML architect","rationale":"Applied ML partner","supportedCapability":"applied ML partner","source":{"title":"Jordan profile","url":"https://example.com/jordan","quote":"Jordan designs applied ML systems."}}]}',
+            "annotations": [{"type": "url_citation", "url_citation": {"url": "https://example.com/alex", "title": "Profile", "content": "Alex builds climate software."}}, {"type": "url_citation", "url_citation": {"url": "https://example.com/jordan", "title": "Jordan profile", "content": "Jordan designs applied ML systems."}}],
+        }}]}
+        with patch.object(main.PROVIDER, "json_completion", return_value=None), patch.object(main.PROVIDER, "_post", return_value=response) as post:
+            result = self.capture("p1", "Alex Example", "", "I need an applied ML partner.")
+        self.assertTrue(post.called)
+        self.assertEqual(result["profile"]["publicOffers"], ["climate domain expertise"])
+        self.assertEqual(result["profile"]["researchEvidence"][0]["sourceURL"], "https://example.com/alex")
+        self.assertEqual(result["profile"]["publicCandidates"][0]["name"], "Jordan Research")
+        self.assertGreaterEqual(len(result["opportunities"]), 1)
+        self.assertIn("verify_sources", [item["tool"] for item in result["trace"]])
 
     def test_semantic_match_has_no_named_demo_branch(self):
         self.capture("p1", "Alex", "alex@example.com", "I need an applied ML partner. I can offer climate domain expertise.")

@@ -114,11 +114,18 @@ export OPENROUTER_API_KEY='…'
 export OPENROUTER_MODEL='~openai/gpt-latest'
 export OPENROUTER_EMBEDDING_MODEL='qwen/qwen3-embedding-8b'
 export OPENROUTER_EMBEDDING_DIMENSIONS='4096'
+
+# Evidence-backed public professional research (enabled by default)
+export SECONDHELLO_PUBLIC_RESEARCH='1'
+export OPENROUTER_SEARCH_ENGINE='auto'
+export OPENROUTER_SEARCH_RESULTS='6'
+export OPENROUTER_SEARCH_MAX_USES='3'
+export PUBLIC_RESEARCH_MIN_CONFIDENCE='0.72'
 ```
 
 Optional endpoint overrides are `FIREWORKS_CHAT_URL`, `FIREWORKS_EMBEDDING_URL`, `OPENROUTER_CHAT_URL`, and `OPENROUTER_EMBEDDING_URL`. Other server settings are `SECONDHELLO_HOST`, `SECONDHELLO_PORT`, `SECONDHELLO_MEMORY_FILE`, `SECONDHELLO_MATCH_THRESHOLD`, `MONGODB_TIMEOUT_MS`, and `PROVIDER_TIMEOUT_SECONDS`.
 
-The native voice client enables macOS voice processing by default. For a local acoustic-loopback test only, launch the executable with `SECONDHELLO_VOICE_PROCESSING_ENABLED=0`; normal runs should leave it enabled to suppress speaker echo.
+The native voice client uses raw PCM by default because it is reliable across built-in, USB, and virtual microphones. Set `SECONDHELLO_VOICE_PROCESSING_ENABLED=1` only for a microphone route known to work with macOS voice processing.
 
 ## ElevenLabs realtime voice
 
@@ -145,8 +152,9 @@ The optional imported-file transcription and spoken-briefing tools are legacy di
 The LangGraph path is:
 
 ```text
-request → consent_gate ─┬─ capture → extract_memory → persist_memory → find_introductions
-                        ├─ match ───────────────────→ find_introductions
+request → consent_gate ─┬─ capture → extract_memory → plan_public_research → web_research
+                        │             → verify_sources → persist_memory → find_introductions → rank_opportunities
+                        ├─ match ───────────────────→ find_introductions → rank_opportunities
                         ├─ draft ───────────────────→ compose_introduction
                         └─ approved Mail handoff ───→ record_action
 ```
