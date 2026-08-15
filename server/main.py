@@ -101,8 +101,10 @@ class WorkflowState(TypedDict, total=False):
     action_receipt: dict[str, Any]
     memory: dict[str, Any]
     profile: dict[str, Any]
+    identityResolution: dict[str, Any]
     research_query: str
     research: dict[str, Any]
+    followUp: dict[str, Any]
     opportunities: list[dict[str, Any]]
     draft: dict[str, str]
     route: str
@@ -211,7 +213,7 @@ class Provider:
                 }}],
                 "max_tool_calls": int(env("OPENROUTER_SEARCH_MAX_USES", "3")),
                 "messages": [{"role": "system", "content": system}, {"role": "user", "content": query}],
-            }, timeout=float(env("PUBLIC_RESEARCH_TIMEOUT_SECONDS", "35")))
+            }, timeout=float(env("PUBLIC_RESEARCH_TIMEOUT_SECONDS", "15")))
             message = result["choices"][0]["message"]
             content = message["content"]
             if isinstance(content, str) and content.startswith("```"):
@@ -368,14 +370,27 @@ def sanitize_memory(memory: dict[str, Any]) -> dict[str, Any]:
         ]
         conversation["profile"] = profile
         conversations.append(conversation)
-    return {**memory, "people": people, "conversations": conversations, "actions": memory.get("actions", [])}
+    follow_ups = [
+        item for item in memory.get("followUps", [])
+        if isinstance(item, dict)
+        and item.get("personID") in person_ids
+        and valid_person_name(item.get("personName"))
+    ]
+    return {
+        **memory,
+        "schemaVersion": 3,
+        "people": people,
+        "conversations": conversations,
+        "followUps": follow_ups,
+        "actions": memory.get("actions", []),
+    }
 
 
 def local_profile(transcript: str, conversation_id: str) -> dict[str, Any]:
     lines = sentences(transcript)
     rules = {
-        "needs": (r"\b(?:need|needs|looking for|seeking)\b\s*(.*)",),
-        "offers": (r"\b(?:can offer|offer|offers|can help with|i build|i work on)\b\s*(.*)",),
+        "needs": (r"\b(?:need|needs|looking for|searching for|seeking|trying to find|want|would like)\b\s*(.*)",),
+        "offers": (r"\b(?:can offer|offer|offers|can help with|happy to|provide|can introduce|can connect|i build|i work on)\b\s*(.*)",),
         "topics": (r"\b(?:interested in|care about|focused on|passionate about)\b\s*(.*)",),
         "commitments": (r"\b(?:i will|i'll|will send|will share|will introduce|follow up)\b.*",),
     }
@@ -386,17 +401,73 @@ def local_profile(transcript: str, conversation_id: str) -> dict[str, Any]:
                 found = re.search(pattern, line, flags=re.I)
                 if found:
                     value = found.group(1) if found.lastindex else found.group(0)
+                    # Speech-to-text often places two explicit facts in one
+                    # sentence: "I need X and I can offer Y". Keep each fact
+                    # bounded so the matcher never treats the whole sentence
+                    # as one need or offer.
+                    value = re.split(r"\s+(?:,\s*)?(?:and\s+)?i(?:'m| am| can| will| work| do| need| want)\b", value, maxsplit=1, flags=re.I)[0]
                     value = value.strip(" .,:;-")
                     if value and value not in result[key]:
                         result[key].append(value)
                     break
     result["evidence"] = [{"id": str(uuid4()), "quote": line, "conversationID": conversation_id, "capturedAt": utc_now()} for line in lines]
+    result.update(explicit_identity_details(transcript))
     return result
+
+
+def explicit_identity_details(transcript: str) -> dict[str, str]:
+    """Extract only role/company phrases explicitly spoken in the conversation."""
+    role = company = ""
+    for line in sentences(transcript):
+        normalized = " ".join(line.split())
+        role_match = re.search(
+            r"\b(?:i am|i['’]m)\s+(?:(?:the|a|an|one of the)\s+)?(.{2,80}?)\s+(?:at|for|with)\s+(?:a company called\s+)?([^,.!?;]{2,80})",
+            normalized,
+            flags=re.I,
+        )
+        if role_match:
+            role_candidate = role_match.group(1).strip(" .,-")
+            company_candidate = re.split(r"\s+(?:and|where|who|that)\b", role_match.group(2), maxsplit=1, flags=re.I)[0].strip(" .,-")
+            if role_candidate and len(role_candidate.split()) <= 10:
+                role = role or role_candidate
+            if company_candidate and len(company_candidate.split()) <= 8:
+                company = company or company_candidate
+        company_match = re.search(
+            r"\b(?:i\s+)?work(?:ing)?\s+(?:at|for|with)\s+(?:a company called\s+)?([^,.!?;]{2,80})",
+            normalized,
+            flags=re.I,
+        )
+        if company_match:
+            company_candidate = re.split(r"\s+(?:and|where|who|that)\b", company_match.group(1), maxsplit=1, flags=re.I)[0].strip(" .,-")
+            if company_candidate and len(company_candidate.split()) <= 8:
+                company = company or company_candidate
+    return {"role": role, "company": company}
+
+
+def grounded_memory_value(value: Any, transcript: str, cue_pattern: str | None = None) -> bool:
+    """Accept provider extraction only when a cited transcript sentence supports it."""
+    candidate_tokens = set(tokens(str(value)))
+    if not candidate_tokens:
+        return False
+    minimum_overlap = max(1, min(4, (len(candidate_tokens) + 1) // 2))
+    for line in sentences(transcript):
+        if cue_pattern and not re.search(cue_pattern, line, flags=re.I):
+            continue
+        overlap = candidate_tokens.intersection(tokens(line))
+        if len(overlap) >= minimum_overlap:
+            return True
+    return False
+
+
+NEED_CUE = r"\b(?:need|needs|looking for|searching for|seeking|trying to find|want|would like)\b"
+OFFER_CUE = r"\b(?:can offer|offer|offers|can help with|happy to|provide|can introduce|can connect|i build|i work on)\b"
+COMMITMENT_CUE = r"\b(?:i will|i'll|will send|will share|will introduce|follow up)\b"
 
 
 def extract_profile(transcript: str, conversation_id: str) -> tuple[dict[str, Any], str]:
     schema_prompt = (
-        "Extract only explicitly stated networking memory. Return JSON with arrays named needs, offers, topics, commitments. "
+        "Extract only explicitly stated networking memory. Return JSON with arrays named needs, offers, topics, commitments "
+        "and strings named role and company. "
         "Do not infer sensitive traits or facts. Preserve concise wording from the transcript."
     )
     parsed = PROVIDER.json_completion(schema_prompt, transcript)
@@ -405,9 +476,144 @@ def extract_profile(transcript: str, conversation_id: str) -> tuple[dict[str, An
     profile = {}
     for key in ("needs", "offers", "topics", "commitments"):
         values = parsed.get(key, [])
-        profile[key] = [str(value).strip() for value in values if str(value).strip()] if isinstance(values, list) else []
+        if not isinstance(values, list):
+            profile[key] = []
+            continue
+        cue = {"needs": NEED_CUE, "offers": OFFER_CUE, "commitments": COMMITMENT_CUE}.get(key)
+        profile[key] = [
+            str(value).strip()
+            for value in values
+            if str(value).strip() and grounded_memory_value(value, transcript, cue)
+        ]
+    local_identity = explicit_identity_details(transcript)
+    for key, cue in (
+        ("role", r"\b(?:i am|i['’]m|my role is|work as|head of|founder|co-founder)\b"),
+        ("company", r"\b(?:work at|work for|work with|company called|at|for)\b"),
+    ):
+        candidate = str(parsed.get(key, "")).strip()
+        profile[key] = candidate if candidate and grounded_memory_value(candidate, transcript, cue) else local_identity[key]
     profile["evidence"] = [{"id": str(uuid4()), "quote": line, "conversationID": conversation_id, "capturedAt": utc_now()} for line in sentences(transcript)]
     return profile, PROVIDER.name
+
+
+def identity_resolution(person: dict[str, Any], profile: dict[str, Any]) -> dict[str, Any]:
+    """Decide whether public search has enough distinct, transcript-grounded clues."""
+    name = " ".join(str(person.get("name", "")).split())
+    company = str(profile.get("company", "")).strip()
+    role = str(profile.get("role", "")).strip()
+    professional_context = next((
+        str(value).strip()
+        for key in ("topics", "needs", "offers")
+        for value in profile.get(key, [])
+        if str(value).strip()
+    ), "")
+    clues = []
+    if len(name.split()) > 1:
+        clues.append({"kind": "full_name", "label": "Full name", "value": name})
+    else:
+        clues.append({"kind": "first_name", "label": "First name", "value": name})
+    if company:
+        clues.append({"kind": "company", "label": "Company", "value": company})
+    if role:
+        clues.append({"kind": "role", "label": "Role", "value": role})
+    if professional_context:
+        clues.append({"kind": "context", "label": "Conversation context", "value": professional_context})
+    enough = (len(name.split()) > 1 and bool(company or role or professional_context)) or bool(company and role)
+    return {
+        "status": "ready" if enough else "collecting",
+        "verified": False,
+        "clues": clues,
+        "queryTerms": [value for value in (name, company, role, professional_context) if value],
+        "message": "Enough identifying context to search safely" if enough else "Contact saved; listening for a company, role, or full name before searching",
+    }
+
+
+def concise_discussion(transcript: str, person_name: str, limit: int = 220) -> str:
+    """Create a transcript-only summary without asking a model to invent context."""
+    values = []
+    introduction = re.compile(
+        rf"^(?:hey[,.]?\s*)?(?:this is|my name is|i am|i['’]m)\s+{re.escape(person_name)}\b[,.!?\s-]*",
+        flags=re.I,
+    )
+    for line in sentences(transcript):
+        cleaned = introduction.sub("", " ".join(line.split())).strip(" .,-")
+        if cleaned and len(tokens(cleaned)) >= 2:
+            values.append(cleaned)
+        if len(" ".join(values)) >= limit:
+            break
+    summary = " ".join(values) or " ".join(transcript.split())
+    if len(summary) <= limit:
+        return summary
+    shortened = summary[: limit - 1].rsplit(" ", 1)[0].rstrip(" ,.;:")
+    return f"{shortened}…"
+
+
+def linkedin_search_url(person: dict[str, Any], profile: dict[str, Any]) -> str:
+    public_sources = [
+        item.get("sourceURL") for item in profile.get("researchEvidence", [])
+        if isinstance(item, dict) and "linkedin.com/" in str(item.get("sourceURL", "")).lower()
+    ]
+    if public_sources:
+        return str(public_sources[0])
+    context = " ".join(str(value) for value in profile.get("publicRoles", [])[:2])
+    keywords = " ".join(part for part in (str(person.get("name", "")), context) if part).strip()
+    return "https://www.linkedin.com/search/results/people/?" + urllib.parse.urlencode({"keywords": keywords})
+
+
+def build_follow_up(person: dict[str, Any], conversation: dict[str, Any]) -> dict[str, Any]:
+    """Build one grounded follow-up for every consented person, independent of matching."""
+    profile = conversation.get("profile", {}) if isinstance(conversation.get("profile"), dict) else {}
+    summary = concise_discussion(str(conversation.get("transcript", "")), str(person.get("name", "the person")))
+    discussed = list(dict.fromkeys(
+        str(value).strip()
+        for key in ("topics", "needs", "offers", "commitments")
+        for value in profile.get(key, [])
+        if str(value).strip()
+    ))[:6]
+    reference = (discussed[0] if discussed else summary).strip(" .")
+    if len(reference) > 120:
+        reference = reference[:119].rsplit(" ", 1)[0].rstrip(" ,.;:") + "…"
+    name = str(person.get("name", "there"))
+    note = f"Hi {name}, great meeting you. I enjoyed our conversation about {reference}. I'd like to stay connected and follow up."
+    if len(note) > 300:
+        note = f"Hi {name}, great meeting you. I enjoyed our conversation and would like to stay connected and follow up."
+    commitments = [str(value).strip() for value in profile.get("commitments", []) if str(value).strip()]
+    next_step = commitments[0] if commitments else f"Review and send the prepared connection note to {name}"
+    evidence = [
+        item for item in profile.get("evidence", [])
+        if isinstance(item, dict) and str(item.get("quote", "")).strip()
+    ][:3]
+    resolution = person.get("identityResolution") or identity_resolution(person, {**profile, **explicit_identity_details(str(conversation.get("transcript", "")))})
+    return {
+        "id": str(uuid5(NAMESPACE_URL, str(conversation.get("id", "")) + "::follow-up")),
+        "personID": person.get("id"),
+        "personName": name,
+        "email": person.get("email") or "",
+        "conversationID": conversation.get("id"),
+        "summary": summary,
+        "discussed": discussed,
+        "role": (profile.get("publicRoles") or [""])[0],
+        "identityResolution": resolution,
+        "nextStep": next_step,
+        "connectionNote": note,
+        "profileURL": linkedin_search_url(person, profile),
+        "status": "new",
+        "evidence": evidence,
+        "createdAt": conversation.get("timestamp") or utc_now(),
+        "updatedAt": utc_now(),
+        "workflowCompletedAt": utc_now(),
+    }
+
+
+def derive_missing_follow_ups(memory: dict[str, Any]) -> dict[str, Any]:
+    """Make pre-v3 conversations visible as follow-ups without mutating storage on read."""
+    people = {person.get("id"): person for person in memory.get("people", [])}
+    follow_ups = {item.get("conversationID"): item for item in memory.get("followUps", [])}
+    for conversation in memory.get("conversations", []):
+        person = people.get(conversation.get("personID"))
+        if person and conversation.get("consented") is True and conversation.get("id") not in follow_ups:
+            follow_ups[conversation.get("id")] = build_follow_up(person, conversation)
+    return {**memory, "followUps": sorted(follow_ups.values(), key=lambda item: str(item.get("createdAt", "")))}
 
 
 class MemoryBackend:
@@ -432,22 +638,23 @@ class MemoryBackend:
                 self.startup_warning = f"Atlas unavailable ({type(error).__name__}); using local JSON"
 
     def _empty(self) -> dict[str, Any]:
-        return {"schemaVersion": 2, "people": [], "conversations": [], "actions": []}
+        return {"schemaVersion": 3, "people": [], "conversations": [], "followUps": [], "actions": []}
 
     def load(self) -> dict[str, Any]:
         if self.database is not None:
-            return sanitize_memory({
-                "schemaVersion": 2,
+            return derive_missing_follow_ups(sanitize_memory({
+                "schemaVersion": 3,
                 "people": list(self.database.people.find({}, {"_id": False})),
                 "conversations": list(self.database.conversations.find({}, {"_id": False, "embedding": False})),
+                "followUps": list(self.database.followups.find({}, {"_id": False})),
                 "actions": list(self.database.actions.find({}, {"_id": False})),
-            })
+            }))
         with self.lock:
             if not self.path.exists():
                 return self._empty()
             data = json.loads(self.path.read_text())
             data.setdefault("actions", [])
-            return sanitize_memory(data)
+            return derive_missing_follow_ups(sanitize_memory(data))
 
     def _write_local(self, memory: dict[str, Any]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -481,9 +688,18 @@ class MemoryBackend:
             memory["conversations"] = [value for value in memory["conversations"] if value.get("id") != conversation["id"]] + [conversation]
             self._write_local(memory)
 
+    def persist_follow_up(self, follow_up: dict[str, Any]) -> None:
+        if self.database is not None:
+            self.database.followups.replace_one({"id": follow_up["id"]}, follow_up, upsert=True)
+            return
+        with self.lock:
+            memory = self.load_unlocked()
+            memory["followUps"] = [item for item in memory.get("followUps", []) if item.get("id") != follow_up["id"]] + [follow_up]
+            self._write_local(memory)
+
     def load_unlocked(self) -> dict[str, Any]:
         if not self.path.exists(): return self._empty()
-        data = json.loads(self.path.read_text()); data.setdefault("actions", []); return sanitize_memory(data)
+        data = json.loads(self.path.read_text()); data.setdefault("actions", []); data.setdefault("followUps", []); return sanitize_memory(data)
 
     def record_action(self, receipt: dict[str, Any]) -> None:
         if self.database is not None:
@@ -494,7 +710,7 @@ class MemoryBackend:
     def erase_all(self) -> None:
         """Delete all stored relationship data for this self-hosted instance."""
         if self.database is not None:
-            for collection in (self.database.people, self.database.conversations, self.database.memory_items, self.database.actions):
+            for collection in (self.database.people, self.database.conversations, self.database.followups, self.database.memory_items, self.database.actions):
                 collection.delete_many({})
             return
         with self.lock:
@@ -533,20 +749,119 @@ def extract_tool(state: WorkflowState) -> WorkflowState:
     conversation = state["conversation"]
     profile, mode = extract_profile(conversation["transcript"], conversation["id"])
     memory_count = sum(len(profile[key]) for key in ("needs", "offers", "topics", "commitments"))
-    return {"profile": profile, "route": "plan_research", "trace": trace(state, "extract_memory", f"Extracted {memory_count} explicit memories", mode, subject=state["person"]["name"], memoryCount=memory_count)}
+    return {"profile": profile, "route": "resolve_identity", "trace": trace(state, "extract_memory", f"Extracted {memory_count} explicit memories", mode, subject=state["person"]["name"], memoryCount=memory_count)}
+
+
+def resolve_identity_tool(state: WorkflowState) -> WorkflowState:
+    resolution = identity_resolution(state["person"], state["profile"])
+    clue_labels = [item["label"] for item in resolution["clues"]]
+    return {
+        "identityResolution": resolution,
+        "route": "checkpoint_contact",
+        "trace": trace(
+            state,
+            "resolve_identity",
+            resolution["message"],
+            "identity safety policy",
+            subject=state["person"]["name"],
+            identityStatus=resolution["status"],
+            clues=clue_labels,
+        ),
+    }
+
+
+def checkpoint_contact_tool(state: WorkflowState) -> WorkflowState:
+    conversation = dict(state["conversation"])
+    profile = dict(state["profile"])
+    previous_memory = BACKEND.load()
+    previous_conversation = next((item for item in previous_memory.get("conversations", []) if item.get("id") == conversation.get("id")), {})
+    previous_profile = previous_conversation.get("profile", {}) if isinstance(previous_conversation.get("profile"), dict) else {}
+    for key in ("publicSummary", "publicRoles", "publicOffers", "researchEvidence", "publicCandidates", "researchAttemptedAt"):
+        if key in previous_profile:
+            profile[key] = previous_profile[key]
+    previous_person = next((item for item in previous_memory.get("people", []) if item.get("id") == state["person"].get("id")), {})
+    previous_resolution = previous_person.get("identityResolution", {}) if isinstance(previous_person.get("identityResolution"), dict) else {}
+    resolution = state.get("identityResolution", {})
+    if previous_profile.get("researchAttemptedAt") and previous_resolution.get("status") in {"verified", "ambiguous"}:
+        resolution = previous_resolution
+    conversation["profile"] = profile
+    person = {**state["person"], "identityResolution": resolution}
+    BACKEND.persist_capture(person, conversation)
+    return {
+        "person": person,
+        "conversation": conversation,
+        "profile": profile,
+        "identityResolution": resolution,
+        "route": "plan_research",
+        "trace": trace(
+            state,
+            "save_contact",
+            "Saved the person and conversation before optional public research",
+            BACKEND.mode,
+            subject=person["name"],
+            identityStatus=state.get("identityResolution", {}).get("status"),
+        ),
+    }
 
 
 def plan_research_tool(state: WorkflowState) -> WorkflowState:
     person = state["person"]
     profile = state["profile"]
+    resolution = state.get("identityResolution", identity_resolution(person, profile))
+    if profile.get("researchAttemptedAt"):
+        return {
+            "research_query": "",
+            "route": "research",
+            "trace": trace(
+                state,
+                "plan_public_research",
+                "Reused the completed identity decision instead of repeating public research",
+                "cached identity decision",
+                subject=person["name"],
+                identityStatus=resolution.get("status", "ambiguous"),
+                cached=True,
+            ),
+        }
+    if resolution.get("status") != "ready":
+        return {
+            "research_query": "",
+            "route": "research",
+            "trace": trace(
+                state,
+                "plan_public_research",
+                "Deferred public search until more identifying context is spoken",
+                "identity safety policy",
+                subject=person["name"],
+                identityStatus="collecting",
+                clues=[item.get("label") for item in resolution.get("clues", [])],
+            ),
+        }
     context = "; ".join((profile.get("needs", []) + profile.get("offers", []) + profile.get("topics", []))[:6])
-    query = f'Research the public professional identity of "{person["name"]}". Professional context from a consented conversation: {context or state["conversation"]["transcript"][:500]}'
+    identity_terms = "; ".join(str(value) for value in resolution.get("queryTerms", []) if str(value).strip())
+    query = f'Research the public professional identity of "{person["name"]}". Identity clues: {identity_terms}. Professional context from a consented conversation: {context or state["conversation"]["transcript"][:500]}'
     enabled = PROVIDER.name == "OpenRouter" and env("SECONDHELLO_PUBLIC_RESEARCH", "1") != "0"
     detail = "Prepared a bounded identity-resolution query from name and professional context" if enabled else "Public research provider is unavailable; preserved the offline path"
-    return {"research_query": query, "route": "research", "trace": trace(state, "plan_public_research", detail, PROVIDER.name, subject=person["name"])}
+    searching = {**resolution, "status": "searching", "message": f"Searching with {', '.join(resolution.get('queryTerms', [])[:3])}"}
+    return {"identityResolution": searching, "research_query": query, "route": "research", "trace": trace(state, "plan_public_research", detail, PROVIDER.name, subject=person["name"], identityStatus="searching", queryTerms=resolution.get("queryTerms", [])[:4])}
 
 
 def research_tool(state: WorkflowState) -> WorkflowState:
+    if not state.get("research_query"):
+        cached = bool(state.get("profile", {}).get("researchAttemptedAt"))
+        return {
+            "research": {"matched": False, "deferred": not cached, "cached": cached},
+            "route": "verify_research",
+            "trace": trace(
+                state,
+                "web_research",
+                "Reused the previous identity decision" if cached else "Skipped public search because the identity is not specific enough yet",
+                "cached identity decision" if cached else "identity safety policy",
+                subject=state["person"]["name"],
+                skipped=not cached,
+                cached=cached,
+                identityStatus=state.get("identityResolution", {}).get("status", "collecting"),
+            ),
+        }
     research, mode = PROVIDER.public_research(state.get("research_query", ""))
     source_count = len(research.get("sources", [])) if isinstance(research.get("sources"), list) else 0
     subject = state["person"]["name"]
@@ -561,6 +876,10 @@ def verify_research_tool(state: WorkflowState) -> WorkflowState:
     confidence = float(research.get("confidence", 0) or 0)
     accepted_identity = bool(research.get("matched")) and confidence >= float(env("PUBLIC_RESEARCH_MIN_CONFIDENCE", "0.72")) and bool(sources)
     cited_candidates = [candidate for candidate in research.get("candidateConnections", []) if isinstance(candidate, dict) and isinstance(candidate.get("source"), dict) and candidate["source"].get("url")]
+    resolution = dict(state.get("identityResolution", {}))
+    if research.get("cached"):
+        detail = "Reused the prior cited or safely rejected identity decision"
+        return {"profile": profile, "identityResolution": resolution, "route": "persist", "trace": trace(state, "verify_sources", detail, "cached identity decision", subject=state["person"]["name"], found=bool(resolution.get("verified")), candidateCount=len(profile.get("publicCandidates", [])), identityStatus=resolution.get("status"), cached=True)}
     if accepted_identity:
         evidence = [{"id": str(uuid4()), "quote": str(item.get("quote") or item.get("title") or "Public professional source"), "conversationID": state["conversation"]["id"], "capturedAt": utc_now(), "sourceURL": item.get("url"), "sourceTitle": item.get("title")} for item in sources]
         profile["publicSummary"] = str(research.get("summary", "")).strip() or None
@@ -568,24 +887,51 @@ def verify_research_tool(state: WorkflowState) -> WorkflowState:
         profile["publicOffers"] = [str(value).strip() for value in research.get("offers", []) if str(value).strip()][:8]
         profile["researchEvidence"] = evidence
         identity_detail = f"accepted identity at {confidence:.0%} confidence"
+        resolution.update({"status": "verified", "verified": True, "confidence": confidence, "message": f"Public identity verified from {len(sources)} cited source(s)"})
     else:
         profile["publicSummary"] = None; profile["publicRoles"] = []; profile["publicOffers"] = []; profile["researchEvidence"] = []
-        identity_detail = "rejected ambiguous identity enrichment"
+        if research.get("deferred"):
+            resolution.update({"status": "collecting", "verified": False, "message": "Contact saved; public identity remains unverified until more context is available"})
+            identity_detail = "kept identity unverified while collecting more context"
+        else:
+            resolution.update({"status": "ambiguous", "verified": False, "confidence": confidence, "message": "Search results were not specific enough to attach safely"})
+            profile["researchAttemptedAt"] = utc_now()
+            identity_detail = "rejected ambiguous identity enrichment"
+    if accepted_identity:
+        profile["researchAttemptedAt"] = utc_now()
     profile["publicCandidates"] = cited_candidates[:3]
     detail = f"{identity_detail}; accepted {len(profile['publicCandidates'])} independently cited opportunity candidate(s)"
-    return {"profile": profile, "route": "persist", "trace": trace(state, "verify_sources", detail, "evidence policy", subject=state["person"]["name"], found=accepted_identity, candidateCount=len(profile["publicCandidates"]))}
+    return {"profile": profile, "identityResolution": resolution, "route": "persist", "trace": trace(state, "verify_sources", detail, "evidence policy", subject=state["person"]["name"], found=accepted_identity, candidateCount=len(profile["publicCandidates"]), identityStatus=resolution.get("status"))}
 
 
 def persist_tool(state: WorkflowState) -> WorkflowState:
     conversation = dict(state["conversation"]); conversation["profile"] = state["profile"]
     person = dict(state["person"])
+    person["identityResolution"] = state.get("identityResolution", {})
     if state["profile"].get("publicSummary"):
         person["publicSummary"] = state["profile"]["publicSummary"]
         person["publicRoles"] = state["profile"].get("publicRoles", [])
         person["researchSources"] = [{"url": item.get("sourceURL"), "title": item.get("sourceTitle")} for item in state["profile"].get("researchEvidence", [])]
     BACKEND.persist_capture(person, conversation)
     discussed = (state["profile"].get("topics", []) + state["profile"].get("needs", []) + state["profile"].get("offers", []))[:4]
-    return {"conversation": conversation, "route": "match", "trace": trace(state, "persist_memory", "Stored consent receipt, evidence, and structured memory", BACKEND.mode, subject=person["name"], topics=discussed)}
+    return {"person": person, "conversation": conversation, "route": "follow_up", "trace": trace(state, "persist_memory", "Stored consent receipt, evidence, and structured memory", BACKEND.mode, subject=person["name"], topics=discussed)}
+
+
+def prepare_follow_up_tool(state: WorkflowState) -> WorkflowState:
+    follow_up = build_follow_up(state["person"], state["conversation"])
+    BACKEND.persist_follow_up(follow_up)
+    return {
+        "followUp": follow_up,
+        "route": "end",
+        "trace": trace(
+            state,
+            "prepare_follow_up",
+            "Prepared a grounded follow-up tracker and editable connection note",
+            BACKEND.mode,
+            subject=follow_up["personName"],
+            discussed=follow_up["discussed"],
+        ),
+    }
 
 
 def profile_map(memory: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -708,13 +1054,13 @@ def record_action_tool(state: WorkflowState) -> WorkflowState:
 
 
 def response(state: WorkflowState) -> dict[str, Any]:
-    return {key: state[key] for key in ("ok", "reason", "person", "profile", "conversation", "opportunities", "draft", "action_receipt", "trace") if key in state}
+    return {key: state[key] for key in ("ok", "reason", "person", "profile", "identityResolution", "conversation", "followUp", "opportunities", "draft", "action_receipt", "trace") if key in state}
 
 
 def run_local(initial: WorkflowState) -> WorkflowState:
     state = dict(initial); state.update(validate_and_route(state))
     while state.get("route") != "end":
-        node = {"extract": extract_tool, "plan_research": plan_research_tool, "research": research_tool, "verify_research": verify_research_tool, "persist": persist_tool, "match": match_tool, "rank": rank_tool, "draft": draft_tool, "record_action": record_action_tool}[state["route"]]
+        node = {"extract": extract_tool, "resolve_identity": resolve_identity_tool, "checkpoint_contact": checkpoint_contact_tool, "plan_research": plan_research_tool, "research": research_tool, "verify_research": verify_research_tool, "persist": persist_tool, "follow_up": prepare_follow_up_tool, "match": match_tool, "rank": rank_tool, "draft": draft_tool, "record_action": record_action_tool}[state["route"]]
         state.update(node(state))
     return state
 
@@ -722,10 +1068,10 @@ def run_local(initial: WorkflowState) -> WorkflowState:
 def build_graph():
     if StateGraph is None: return None
     graph = StateGraph(WorkflowState)
-    graph.add_node("guard", validate_and_route); graph.add_node("extract", extract_tool); graph.add_node("plan_research", plan_research_tool); graph.add_node("research", research_tool); graph.add_node("verify_research", verify_research_tool); graph.add_node("persist", persist_tool); graph.add_node("match", match_tool); graph.add_node("rank", rank_tool); graph.add_node("draft", draft_tool); graph.add_node("record_action", record_action_tool)
+    graph.add_node("guard", validate_and_route); graph.add_node("extract", extract_tool); graph.add_node("resolve_identity", resolve_identity_tool); graph.add_node("checkpoint_contact", checkpoint_contact_tool); graph.add_node("plan_research", plan_research_tool); graph.add_node("research", research_tool); graph.add_node("verify_research", verify_research_tool); graph.add_node("persist", persist_tool); graph.add_node("follow_up", prepare_follow_up_tool); graph.add_node("match", match_tool); graph.add_node("rank", rank_tool); graph.add_node("draft", draft_tool); graph.add_node("record_action", record_action_tool)
     graph.add_edge(START, "guard")
     graph.add_conditional_edges("guard", lambda state: state.get("route", "end"), {"extract": "extract", "match": "match", "draft": "draft", "record_action": "record_action", "end": END})
-    graph.add_edge("extract", "plan_research"); graph.add_edge("plan_research", "research"); graph.add_edge("research", "verify_research"); graph.add_edge("verify_research", "persist"); graph.add_edge("persist", "match"); graph.add_edge("match", "rank"); graph.add_edge("rank", END); graph.add_edge("draft", END); graph.add_edge("record_action", END)
+    graph.add_edge("extract", "resolve_identity"); graph.add_edge("resolve_identity", "checkpoint_contact"); graph.add_edge("checkpoint_contact", "plan_research"); graph.add_edge("plan_research", "research"); graph.add_edge("research", "verify_research"); graph.add_edge("verify_research", "persist"); graph.add_edge("persist", "follow_up"); graph.add_edge("follow_up", END); graph.add_edge("match", "rank"); graph.add_edge("rank", END); graph.add_edge("draft", END); graph.add_edge("record_action", END)
     return graph.compile()
 
 

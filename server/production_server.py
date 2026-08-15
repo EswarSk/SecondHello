@@ -93,10 +93,14 @@ def workflow_events(payload: dict[str, Any]) -> Iterator[dict[str, Any]]:
                         event["trace"] = traces[-1]
                     if "profile" in patch:
                         event["profile"] = patch["profile"]
+                    if "identityResolution" in patch:
+                        event["identityResolution"] = patch["identityResolution"]
                     if "research" in patch:
                         event["research"] = patch["research"]
                     if "opportunities" in patch:
                         event["opportunities"] = patch["opportunities"]
+                    if "followUp" in patch:
+                        event["followUp"] = patch["followUp"]
                     yield event
         yield {"type": "workflow.completed", "result": CORE.response(merged)}
     except Exception as error:  # the client gets a terminal event, never a hanging spinner

@@ -47,11 +47,49 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(main.source_mentions_name("Mansour Saffar", {"url": "https://example.com/mansour-saffar", "title": "Profile", "quote": ""}))
         self.assertFalse(main.source_mentions_name("Mansour Saffar", {"url": "https://example.com/generic", "title": "Profile", "quote": "A professional profile"}))
 
-    def test_capture_calls_extract_persist_and_match_tools(self):
+    def test_capture_calls_extract_persist_and_follow_up_tools(self):
         result = self.capture("p1", "Alex", "alex@example.com", "I need an applied ML partner. I can offer climate domain expertise.")
         self.assertTrue(result["ok"])
-        self.assertEqual([item["tool"] for item in result["trace"]], ["consent_gate", "extract_memory", "plan_public_research", "web_research", "verify_sources", "persist_memory", "find_introductions", "rank_opportunities"])
+        self.assertEqual([item["tool"] for item in result["trace"]], ["consent_gate", "extract_memory", "resolve_identity", "save_contact", "plan_public_research", "web_research", "verify_sources", "persist_memory", "prepare_follow_up"])
         self.assertEqual(main.BACKEND.load()["people"][0]["name"], "Alex")
+
+    def test_every_conversation_becomes_a_grounded_follow_up_without_scripted_phrasing(self):
+        transcript = "Hi, I am Priya. We talked about the product launch, her retail analytics work, and meeting again next week."
+        result = self.capture("p1", "Priya", "", transcript)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["followUp"]["personName"], "Priya")
+        self.assertIn("product launch", result["followUp"]["summary"])
+        self.assertIn("product launch", result["followUp"]["connectionNote"])
+        self.assertLessEqual(len(result["followUp"]["connectionNote"]), 300)
+        self.assertEqual(main.BACKEND.load()["followUps"][0]["conversationID"], "conversation-p1")
+
+    def test_first_name_is_saved_but_public_search_is_deferred(self):
+        result = self.capture("p1", "Sam", "", "Hi, I am Sam. It was great meeting you today.")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["identityResolution"]["status"], "collecting")
+        research_trace = next(item for item in result["trace"] if item["tool"] == "web_research")
+        self.assertTrue(research_trace["skipped"])
+        self.assertEqual(result["followUp"]["personName"], "Sam")
+
+    def test_first_name_with_role_and_company_is_ready_for_identity_search(self):
+        profile = main.local_profile("I'm Ray. I'm the head of marketing for Retail AI. We talked about agentic AI.", "conversation")
+        resolution = main.identity_resolution({"name": "Ray"}, profile)
+        self.assertEqual(profile["role"].lower(), "head of marketing")
+        self.assertEqual(profile["company"], "Retail AI")
+        self.assertEqual(resolution["status"], "ready")
+
+    def test_incremental_snapshots_reuse_completed_identity_research(self):
+        os.environ["OPENROUTER_API_KEY"] = "configured-for-test"
+        os.environ["OPENROUTER_MODEL"] = "openrouter-test-model"
+        os.environ["SECONDHELLO_PROVIDER"] = "openrouter"
+        main.PROVIDER = main.Provider()
+        parsed = {"needs": [], "offers": [], "topics": ["retail analytics"], "commitments": [], "role": "head of marketing", "company": "Retail AI"}
+        with patch.object(main.PROVIDER, "json_completion", return_value=parsed), patch.object(main.PROVIDER, "public_research", return_value=({}, "OpenRouter Web Search")) as research:
+            self.capture("p1", "Jim Sharf", "", "I'm Jim Sharf. I'm the head of marketing for Retail AI. We discussed retail analytics.")
+            result = self.capture("p1", "Jim Sharf", "", "I'm Jim Sharf. I'm the head of marketing for Retail AI. We discussed retail analytics and agentic AI.")
+        self.assertEqual(research.call_count, 1)
+        plan_trace = next(item for item in result["trace"] if item["tool"] == "plan_public_research")
+        self.assertTrue(plan_trace["cached"])
 
     def test_openrouter_research_requires_citations_before_enrichment(self):
         os.environ["OPENROUTER_API_KEY"] = "configured-for-test"
@@ -69,12 +107,31 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(result["profile"]["publicOffers"], ["climate domain expertise"])
         self.assertEqual(result["profile"]["researchEvidence"][0]["sourceURL"], "https://example.com/alex")
         self.assertEqual(result["profile"]["publicCandidates"][0]["name"], "Jordan")
-        self.assertGreaterEqual(len(result["opportunities"]), 1)
+        self.assertEqual(result["followUp"]["personName"], "Alex Example")
         self.assertIn("verify_sources", [item["tool"] for item in result["trace"]])
+
+    def test_provider_questions_do_not_become_networking_needs_or_offers(self):
+        os.environ["OPENROUTER_API_KEY"] = "configured-for-test"
+        os.environ["OPENROUTER_MODEL"] = "openrouter-test-model"
+        os.environ["SECONDHELLO_PROVIDER"] = "openrouter"
+        os.environ["SECONDHELLO_PUBLIC_RESEARCH"] = "0"
+        main.PROVIDER = main.Provider()
+        parsed = {
+            "needs": ["Hear what you are working on", "What problem are you trying to solve?"],
+            "offers": ["A five-minute chat", "Come say hi"],
+            "topics": ["Hackathon projects"],
+            "commitments": [],
+        }
+        with patch.object(main.PROVIDER, "json_completion", return_value=parsed), patch.object(main.PROVIDER, "public_research", return_value=({}, "disabled")):
+            result = self.capture("p1", "Sam Example", "", "I am a founder. I would love to hear what you are building. What problem are you trying to solve?")
+        self.assertEqual(result["profile"]["needs"], [])
+        self.assertEqual(result["profile"]["offers"], [])
+        self.assertEqual(result["profile"]["topics"], [])
 
     def test_semantic_match_has_no_named_demo_branch(self):
         self.capture("p1", "Alex", "alex@example.com", "I need an applied ML partner. I can offer climate domain expertise.")
-        result = self.capture("p2", "Jordan", "jordan@example.com", "I can offer applied ML architecture. I need climate domain expertise.")
+        self.capture("p2", "Jordan", "jordan@example.com", "I can offer applied ML architecture. I need climate domain expertise.")
+        result = main.run_workflow({"action": "match"})
         self.assertGreaterEqual(len(result["opportunities"]), 1)
         first = result["opportunities"][0]
         self.assertIn(first["recipientName"], {"Alex", "Jordan"})
