@@ -426,7 +426,7 @@ function App() {
     if (items.at(-1)?.title === summary.title) items[items.length - 1] = { ...summary, id: event.id };
     else items.push({ ...summary, id: event.id });
     return items;
-  }, []).slice(-5);
+  }, []).slice(-7);
   const activityView = compactActivity.length ? compactActivity.map((item, index) => <div className={`activity-event ${index === compactActivity.length - 1 ? "current" : ""}`} key={item.id}><span className="event-marker">{item.type === "workflow.failed" ? "!" : item.type === "workflow.completed" ? "✓" : "·"}</span><div><strong>{item.title}</strong><small>{item.detail}</small></div><time>{index === compactActivity.length - 1 ? "now" : "done"}</time></div>) : <div className="empty-activity"><span>✦</span><div><strong>Background work will appear here</strong><p>After consent, this shows the current step in plain language.</p></div></div>;
 
   return (
