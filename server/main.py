@@ -111,8 +111,10 @@ class WorkflowState(TypedDict, total=False):
     trace: list[dict[str, Any]]
 
 
-def trace(state: WorkflowState, tool: str, detail: str, mode: str) -> list[dict[str, Any]]:
-    return state.get("trace", []) + [{"id": str(uuid4()), "tool": tool, "detail": detail, "mode": mode, "completedAt": utc_now()}]
+def trace(state: WorkflowState, tool: str, detail: str, mode: str, **metadata: Any) -> list[dict[str, Any]]:
+    entry = {"id": str(uuid4()), "tool": tool, "detail": detail, "mode": mode, "completedAt": utc_now()}
+    entry.update({key: value for key, value in metadata.items() if value is not None})
+    return state.get("trace", []) + [entry]
 
 
 class Provider:
@@ -530,7 +532,8 @@ def validate_and_route(state: WorkflowState) -> WorkflowState:
 def extract_tool(state: WorkflowState) -> WorkflowState:
     conversation = state["conversation"]
     profile, mode = extract_profile(conversation["transcript"], conversation["id"])
-    return {"profile": profile, "route": "plan_research", "trace": trace(state, "extract_memory", f"Extracted {sum(len(profile[key]) for key in ('needs', 'offers', 'topics', 'commitments'))} explicit memories", mode)}
+    memory_count = sum(len(profile[key]) for key in ("needs", "offers", "topics", "commitments"))
+    return {"profile": profile, "route": "plan_research", "trace": trace(state, "extract_memory", f"Extracted {memory_count} explicit memories", mode, subject=state["person"]["name"], memoryCount=memory_count)}
 
 
 def plan_research_tool(state: WorkflowState) -> WorkflowState:
@@ -540,14 +543,15 @@ def plan_research_tool(state: WorkflowState) -> WorkflowState:
     query = f'Research the public professional identity of "{person["name"]}". Professional context from a consented conversation: {context or state["conversation"]["transcript"][:500]}'
     enabled = PROVIDER.name == "OpenRouter" and env("SECONDHELLO_PUBLIC_RESEARCH", "1") != "0"
     detail = "Prepared a bounded identity-resolution query from name and professional context" if enabled else "Public research provider is unavailable; preserved the offline path"
-    return {"research_query": query, "route": "research", "trace": trace(state, "plan_public_research", detail, PROVIDER.name)}
+    return {"research_query": query, "route": "research", "trace": trace(state, "plan_public_research", detail, PROVIDER.name, subject=person["name"])}
 
 
 def research_tool(state: WorkflowState) -> WorkflowState:
     research, mode = PROVIDER.public_research(state.get("research_query", ""))
     source_count = len(research.get("sources", [])) if isinstance(research.get("sources"), list) else 0
+    subject = state["person"]["name"]
     detail = f"Resolved public professional context with {source_count} cited source(s)" if research.get("matched") else "No unambiguous cited public identity was found"
-    return {"research": research, "route": "verify_research", "trace": trace(state, "web_research", detail, mode)}
+    return {"research": research, "route": "verify_research", "trace": trace(state, "web_research", detail, mode, subject=subject, found=bool(research.get("matched")), sourceCount=source_count)}
 
 
 def verify_research_tool(state: WorkflowState) -> WorkflowState:
@@ -569,7 +573,7 @@ def verify_research_tool(state: WorkflowState) -> WorkflowState:
         identity_detail = "rejected ambiguous identity enrichment"
     profile["publicCandidates"] = cited_candidates[:3]
     detail = f"{identity_detail}; accepted {len(profile['publicCandidates'])} independently cited opportunity candidate(s)"
-    return {"profile": profile, "route": "persist", "trace": trace(state, "verify_sources", detail, "evidence policy")}
+    return {"profile": profile, "route": "persist", "trace": trace(state, "verify_sources", detail, "evidence policy", subject=state["person"]["name"], found=accepted_identity, candidateCount=len(profile["publicCandidates"]))}
 
 
 def persist_tool(state: WorkflowState) -> WorkflowState:
@@ -580,7 +584,8 @@ def persist_tool(state: WorkflowState) -> WorkflowState:
         person["publicRoles"] = state["profile"].get("publicRoles", [])
         person["researchSources"] = [{"url": item.get("sourceURL"), "title": item.get("sourceTitle")} for item in state["profile"].get("researchEvidence", [])]
     BACKEND.persist_capture(person, conversation)
-    return {"conversation": conversation, "route": "match", "trace": trace(state, "persist_memory", "Stored consent receipt, evidence, and structured memory", BACKEND.mode)}
+    discussed = (state["profile"].get("topics", []) + state["profile"].get("needs", []) + state["profile"].get("offers", []))[:4]
+    return {"conversation": conversation, "route": "match", "trace": trace(state, "persist_memory", "Stored consent receipt, evidence, and structured memory", BACKEND.mode, subject=person["name"], topics=discussed)}
 
 
 def profile_map(memory: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -668,7 +673,8 @@ def match_tool(state: WorkflowState) -> WorkflowState:
                     "offerEvidence": {"id": str(uuid4()), "quote": str(source.get("quote") or candidate.get("rationale") or capability), "conversationID": "", "capturedAt": utc_now(), "sourceURL": source.get("url"), "sourceTitle": source.get("title")},
                     "searchMode": "OpenRouter Web Search · public candidate",
                 })
-    return {"memory": memory, "opportunities": opportunities, "route": "rank", "trace": trace(state, "find_introductions", f"Compared explicit needs against transcript and cited public capability signals; found {len(opportunities)} candidate(s)", search_mode)}
+    subject = state.get("person", {}).get("name") or "your network"
+    return {"memory": memory, "opportunities": opportunities, "route": "rank", "trace": trace(state, "find_introductions", f"Compared explicit needs against transcript and cited public capability signals; found {len(opportunities)} candidate(s)", search_mode, subject=subject, opportunityCount=len(opportunities))}
 
 
 def rank_tool(state: WorkflowState) -> WorkflowState:
@@ -677,7 +683,8 @@ def rank_tool(state: WorkflowState) -> WorkflowState:
         key = (opportunity["recipientID"], opportunity["connectorID"])
         if key not in unique or opportunity["score"] > unique[key]["score"]: unique[key] = opportunity
     values = sorted(unique.values(), key=lambda item: item["score"], reverse=True)
-    return {"opportunities": values, "route": "end", "trace": trace(state, "rank_opportunities", f"Deduplicated and ranked {len(values)} evidence-backed opportunity(s)", "deterministic policy")}
+    subject = state.get("person", {}).get("name") or "your network"
+    return {"opportunities": values, "route": "end", "trace": trace(state, "rank_opportunities", f"Deduplicated and ranked {len(values)} evidence-backed opportunity(s)", "deterministic policy", subject=subject, opportunityCount=len(values))}
 
 
 def draft_tool(state: WorkflowState) -> WorkflowState:
@@ -701,7 +708,7 @@ def record_action_tool(state: WorkflowState) -> WorkflowState:
 
 
 def response(state: WorkflowState) -> dict[str, Any]:
-    return {key: state[key] for key in ("ok", "reason", "profile", "conversation", "opportunities", "draft", "action_receipt", "trace") if key in state}
+    return {key: state[key] for key in ("ok", "reason", "person", "profile", "conversation", "opportunities", "draft", "action_receipt", "trace") if key in state}
 
 
 def run_local(initial: WorkflowState) -> WorkflowState:

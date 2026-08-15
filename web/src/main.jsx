@@ -73,13 +73,21 @@ function eventLabel(event) {
 }
 
 function simpleActivity(event) {
+  const trace = event.trace || {};
+  const subject = trace.subject || event.result?.person?.name || "the person";
   if (event.type === "workflow.failed") return { title: "Needs attention", detail: "The background workflow stopped safely", type: event.type };
-  if (event.type === "workflow.completed") return { title: "Memory updated", detail: "People, evidence, and connections are ready to review", type: event.type };
+  if (event.type === "workflow.completed") {
+    const count = event.result?.opportunities?.length || 0;
+    return { title: "Memory updated", detail: count ? `Saved ${subject} and found ${count} possible connection${count === 1 ? "" : "s"}` : `Saved ${subject}; no source-backed connection found yet`, type: event.type };
+  }
   if (event.type === "voice.started" || event.type === "agent.notice") return { title: "Listening to the conversation", detail: "Live transcript is active; nothing speaks back", type: event.type };
-  if (["extract_memory", "consent_gate"].includes(event.node)) return { title: "Understanding the conversation", detail: "Using only what was explicitly said", type: event.type };
-  if (["plan_public_research", "web_research", "verify_sources"].includes(event.node)) return { title: "Checking public sources", detail: "Only cited professional information can be used", type: event.type };
-  if (event.node === "persist_memory") return { title: "Saving to your memory", detail: "Consent receipt, transcript, and evidence", type: event.type };
-  if (["find_introductions", "rank_opportunities"].includes(event.node)) return { title: "Finding possible connections", detail: "Matching explicit needs with source-backed offers", type: event.type };
+  if (event.node === "consent_gate") return { title: `Ready to remember ${subject}`, detail: "Consent and the person’s name were confirmed", type: event.type };
+  if (event.node === "extract_memory") return { title: `Understood ${subject}`, detail: `${trace.memoryCount || 0} topic${trace.memoryCount === 1 ? "" : "s"} explicitly mentioned in the conversation`, type: event.type };
+  if (event.node === "plan_public_research") return { title: `Searching for ${subject}`, detail: "Looking only through public professional sources", type: event.type };
+  if (event.node === "web_research") return trace.found ? { title: `Found public information for ${subject}`, detail: `${trace.sourceCount || 0} cited source${trace.sourceCount === 1 ? "" : "s"} returned`, type: event.type } : { title: `Could not verify ${subject}`, detail: "No unambiguous public profile was added", type: event.type };
+  if (event.node === "verify_sources") return trace.found ? { title: `Verified ${subject}`, detail: `${trace.candidateCount || 0} cited research lead${trace.candidateCount === 1 ? "" : "s"} available`, type: event.type } : { title: `Kept ${subject} private`, detail: "Ambiguous research was not saved", type: event.type };
+  if (event.node === "persist_memory") return { title: `Saved ${subject}`, detail: trace.topics?.length ? `Contact and discussed topics: ${trace.topics.join(" · ")}` : "Contact, transcript, and consent receipt saved", type: event.type };
+  if (["find_introductions", "rank_opportunities"].includes(event.node)) return { title: `Found ${trace.opportunityCount || 0} possible connection${trace.opportunityCount === 1 ? "" : "s"}`, detail: trace.opportunityCount ? `Matches for ${subject} use explicit needs and cited offers` : `No evidence-backed match for ${subject} yet`, type: event.type };
   if (event.node === "record_action") return { title: "Recording the handoff", detail: "Nothing is sent without your approval", type: event.type };
   return { title: "Working in the background", detail: event.trace?.mode || "LangGraph", type: event.type };
 }
@@ -239,7 +247,7 @@ function App() {
         if (event.type === "node.completed") {
           if (event.research) setResearch(event.research);
           if (event.opportunities) setOpportunities(event.opportunities);
-          setStatusText(eventLabel(event));
+          setStatusText(simpleActivity(event).title);
         }
         if (event.type === "workflow.completed") {
           result = event.result;
