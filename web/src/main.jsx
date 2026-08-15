@@ -32,9 +32,26 @@ function displayError(error) {
   return error instanceof Error ? error.message : String(error || "Something went wrong");
 }
 
+const personNameStopwords = new Set(["a", "about", "an", "and", "at", "for", "from", "here", "i", "in", "is", "it", "just", "looking", "my", "of", "on", "or", "people", "seeking", "that", "the", "there", "this", "to", "trying", "who", "with", "working"]);
+
+function isPersonName(value) {
+  const normalized = String(value || "").trim().replace(/\s+/g, " ");
+  if (!normalized || normalized.length > 100 || !/^\p{L}[\p{L}'’-]*(?:\s+\p{L}[\p{L}'’-]*){0,3}$/u.test(normalized)) return false;
+  return !normalized.split(" ").some((word) => personNameStopwords.has(word.toLowerCase()));
+}
+
 function speakerName(transcript) {
-  const match = transcript.match(/(?:my name is|this is|i am|i'm|im)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})/i);
-  return match ? match[1].trim() : "";
+  const patterns = [
+    /\b(?:my name is|this is)\s+([^.!?,;\n]+)/i,
+    /\b(?:i am|i'm|im)\s+([^.!?,;\n]+)/i,
+  ];
+  for (const pattern of patterns) {
+    const match = transcript.match(pattern);
+    if (!match) continue;
+    const candidate = match[1].split(/\b(?:and|who|from|at|in|on|with|i|my)\b/i)[0].trim().split(/\s+/).slice(0, 4).join(" ");
+    if (isPersonName(candidate)) return candidate;
+  }
+  return "";
 }
 
 function eventLabel(event) {
@@ -53,6 +70,18 @@ function eventLabel(event) {
     record_action: "Recording the approved handoff",
   };
   return labels[event.node] || event.node || "Agent update";
+}
+
+function simpleActivity(event) {
+  if (event.type === "workflow.failed") return { title: "Needs attention", detail: "The background workflow stopped safely", type: event.type };
+  if (event.type === "workflow.completed") return { title: "Memory updated", detail: "People, evidence, and connections are ready to review", type: event.type };
+  if (event.type === "voice.started" || event.type === "agent.notice") return { title: "Listening to the conversation", detail: "Live transcript is active; nothing speaks back", type: event.type };
+  if (["extract_memory", "consent_gate"].includes(event.node)) return { title: "Understanding the conversation", detail: "Using only what was explicitly said", type: event.type };
+  if (["plan_public_research", "web_research", "verify_sources"].includes(event.node)) return { title: "Checking public sources", detail: "Only cited professional information can be used", type: event.type };
+  if (event.node === "persist_memory") return { title: "Saving to your memory", detail: "Consent receipt, transcript, and evidence", type: event.type };
+  if (["find_introductions", "rank_opportunities"].includes(event.node)) return { title: "Finding possible connections", detail: "Matching explicit needs with source-backed offers", type: event.type };
+  if (event.node === "record_action") return { title: "Recording the handoff", detail: "Nothing is sent without your approval", type: event.type };
+  return { title: "Working in the background", detail: event.trace?.mode || "LangGraph", type: event.type };
 }
 
 function Provider({ children }) {
@@ -177,7 +206,7 @@ function App() {
   }
 
   function scheduleLiveWorkflow(textSnapshot, nameSnapshot) {
-    if (!consentRef.current) return;
+    if (!consentRef.current || !isPersonName(nameSnapshot)) return;
     if (!nameSnapshot) {
       setStatusText("Listening · waiting for a clear introduction");
       return;
@@ -225,7 +254,7 @@ function App() {
   }
 
   async function runLiveWorkflow(textSnapshot, nameSnapshot, force = false) {
-    if (!consentRef.current || !nameSnapshot || !textSnapshot.trim()) return;
+    if (!consentRef.current || !isPersonName(nameSnapshot) || !textSnapshot.trim()) return;
     if (!force && phaseRef.current !== "listening") return;
     if (workflowInFlightRef.current) {
       workflowQueuedRef.current = true;
@@ -275,6 +304,7 @@ function App() {
 
   const startVoice = async () => {
     if (!consent) return setError("Consent must be active before microphone access or voice processing.");
+    if (name.trim() && !isPersonName(name)) return setError("Enter a person’s name, not a sentence or request.");
     setError("");
     setPhase("connecting");
     setStatusText("Requesting microphone permission…");
@@ -383,7 +413,13 @@ function App() {
   };
 
   const liveTranscript = partialTranscript ? `${transcript}${transcript ? "\n" : ""}${partialTranscript}` : transcript;
-  const activityView = activity.length ? activity.map((event, index) => <div className={`activity-event ${index === activity.length - 1 ? "current" : ""}`} key={event.id}><span className="event-marker">{event.type === "workflow.failed" ? "!" : event.type === "workflow.completed" ? "✓" : "·"}</span><div><strong>{event.type === "workflow.completed" ? "Workflow complete" : event.type === "workflow.failed" ? "Workflow failed" : eventLabel(event)}</strong><small>{event.trace?.mode || (event.type === "workflow.completed" ? "Durable result" : "LangGraph event")}</small></div><time>{index === activity.length - 1 ? "now" : "done"}</time></div>) : <div className="empty-activity"><span>✦</span><div><strong>Agent activity will appear here</strong><p>Consent starts the live transcript, research, evidence, matching, and persistence loop.</p></div></div>;
+  const compactActivity = activity.reduce((items, event) => {
+    const summary = simpleActivity(event);
+    if (items.at(-1)?.title === summary.title) items[items.length - 1] = { ...summary, id: event.id };
+    else items.push({ ...summary, id: event.id });
+    return items;
+  }, []).slice(-5);
+  const activityView = compactActivity.length ? compactActivity.map((item, index) => <div className={`activity-event ${index === compactActivity.length - 1 ? "current" : ""}`} key={item.id}><span className="event-marker">{item.type === "workflow.failed" ? "!" : item.type === "workflow.completed" ? "✓" : "·"}</span><div><strong>{item.title}</strong><small>{item.detail}</small></div><time>{index === compactActivity.length - 1 ? "now" : "done"}</time></div>) : <div className="empty-activity"><span>✦</span><div><strong>Background work will appear here</strong><p>After consent, this shows the current step in plain language.</p></div></div>;
 
   return (
     <div className="app-shell">
@@ -394,7 +430,7 @@ function App() {
         <button className="nav-item" onClick={() => document.getElementById("opportunities")?.scrollIntoView({ behavior: "smooth" })}><span>⌁</span> Opportunities <span className="nav-count">{opportunities.length}</span></button>
         <button className="nav-item" onClick={() => document.getElementById("people")?.scrollIntoView({ behavior: "smooth" })}><span>♧</span> People <span className="nav-count">{people.length}</span></button>
         <div className="sidebar-bottom">
-          <div className="status-card"><span className={`status-dot ${health?.ok ? "online" : ""}`}></span><div><strong>{health?.ok ? "Agent online" : "Connecting…"}</strong><small>{storageLabel} · {modeLabel}</small></div></div>
+          <div className="status-card"><span className={`status-dot ${health?.ok ? "online" : ""}`}></span><div><strong>{health?.ok ? "Agent online" : "Connecting…"}</strong><small>{health?.storageFallback ? `${storageLabel} fallback` : storageLabel} · {modeLabel}</small></div></div>
           <button className="settings-button" onClick={() => setSettingsOpen(true)}>⚙ Settings & deployment</button>
         </div>
       </aside>
@@ -422,10 +458,10 @@ function App() {
             <div className="auto-save-state"><span>✦</span><div><strong>Saving continuously after consent</strong><small>Each meaningful turn updates the relationship graph while you remain in the room. Stop only when you want the final sync.</small></div></div>
           </div>
 
-          <div className="agent-panel card"><div className="section-heading compact"><div><span className="eyebrow">LIVE AGENT ACTIVITY</span><h2>What is happening now</h2></div><span className={`agent-state ${workflowBusy ? "working" : ""}`}>{workflowBusy ? "WORKING" : phase === "listening" ? "LISTENING" : "READY"}</span></div><div className="activity-rail">{activityView}</div></div>
+          <div className="agent-panel card"><div className="section-heading compact"><div><span className="eyebrow">BACKGROUND WORK</span><h2>What the agent is doing</h2></div><span className={`agent-state ${workflowBusy ? "working" : ""}`}>{workflowBusy ? "WORKING" : phase === "listening" ? "LISTENING" : "READY"}</span></div><div className="activity-rail">{activityView}</div></div>
         </section>
 
-        <section className="insights-grid" id="people"><div className="insight-panel card"><div className="section-heading compact"><div><span className="eyebrow">RELATIONSHIP GRAPH</span><h2>People in the room</h2></div><span className="number-badge">{people.length}</span></div>{people.length ? people.slice(-4).reverse().map((person) => <div className="person-row" key={person.id}><div className="avatar">{person.name?.slice(0, 1).toUpperCase()}</div><div><strong>{person.name}</strong><small>{person.email || "Professional context captured"}</small></div><span className="row-status">{person.id === latestPerson?.id ? "Just now" : "Remembered"}</span></div>) : <div className="empty-panel">Consent to a conversation and the person will appear here immediately.</div>}</div><div className="insight-panel card" id="opportunities"><div className="section-heading compact"><div><span className="eyebrow">EVIDENCE-BACKED MATCHES</span><h2>Connections worth making</h2></div><span className="number-badge accent">{opportunities.length}</span></div>{opportunities.length ? opportunities.slice(0, 3).map((opportunity) => <button className="opportunity-row" key={opportunity.id} onClick={() => openDraft(opportunity)}><div className="match-line"><span>{opportunity.recipientName}</span><b>↔</b><span>{opportunity.connectorName}</span><em>{Math.round((opportunity.score || 0) * 100)}%</em></div><p><strong>{opportunity.recipientName}</strong> needs {opportunity.need}; <strong>{opportunity.connectorName}</strong> offers {opportunity.offer}.</p><small>{opportunity.searchMode} · Review evidence {icons.arrow}</small></button>) : <div className="empty-panel">Research and matching results will land here after the workflow completes.</div>}</div></section>
+        <section className="insights-grid" id="people"><div className="insight-panel card"><div className="section-heading compact"><div><span className="eyebrow">RELATIONSHIP GRAPH</span><h2>People in the room</h2></div><span className="number-badge">{people.length}</span></div>{people.length ? people.slice(-4).reverse().map((person) => <div className="person-row" key={person.id}><div className="avatar">{person.name?.slice(0, 1).toUpperCase()}</div><div><strong>{person.name}</strong><small>{person.email || "Professional context captured"}</small></div><span className="row-status">{person.id === latestPerson?.id ? "Just now" : "Remembered"}</span></div>) : <div className="empty-panel">Consent to a conversation and the person will appear here immediately.</div>}</div><div className="insight-panel card" id="opportunities"><div className="section-heading compact"><div><span className="eyebrow">SOURCE-BACKED LEADS</span><h2>Possible connections</h2></div><span className="number-badge accent">{opportunities.length}</span></div>{opportunities.length ? opportunities.slice(0, 3).map((opportunity) => <button className="opportunity-row" key={opportunity.id} onClick={() => openDraft(opportunity)}><div className="match-line"><span>{opportunity.recipientName}</span><b>↔</b><span>{opportunity.connectorName}</span><em>{Math.round((opportunity.score || 0) * 100)}%</em></div><p><strong>{opportunity.connectorName}</strong> may help with <strong>{opportunity.need}</strong>, based on {opportunity.offer}.</p><small>{opportunity.searchMode} · Review source {icons.arrow}</small></button>) : <div className="empty-panel">No source-backed connection leads yet. Keep talking or add another person.</div>}</div></section>
 
         <footer className="footer"><span>Second Hello is local-first by design.</span><span>Consent receipt · Human approval · Nothing sent automatically</span></footer>
       </main>

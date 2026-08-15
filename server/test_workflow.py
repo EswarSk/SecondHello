@@ -37,6 +37,16 @@ class WorkflowTests(unittest.TestCase):
         self.assertFalse(self.path.exists())
         self.assertEqual([item["tool"] for item in result["trace"]], ["consent_gate"])
 
+    def test_sentence_fragment_cannot_be_saved_as_person(self):
+        result = self.capture("fragment", "looking for opportunities", "", "I am looking for opportunities and people who work on agentic AI.")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "valid_person_name_required")
+        self.assertFalse(self.path.exists())
+
+    def test_research_candidate_name_requires_cited_source_support(self):
+        self.assertTrue(main.source_mentions_name("Mansour Saffar", {"url": "https://example.com/mansour-saffar", "title": "Profile", "quote": ""}))
+        self.assertFalse(main.source_mentions_name("Mansour Saffar", {"url": "https://example.com/generic", "title": "Profile", "quote": "A professional profile"}))
+
     def test_capture_calls_extract_persist_and_match_tools(self):
         result = self.capture("p1", "Alex", "alex@example.com", "I need an applied ML partner. I can offer climate domain expertise.")
         self.assertTrue(result["ok"])
@@ -50,7 +60,7 @@ class WorkflowTests(unittest.TestCase):
         main.PROVIDER = main.Provider()
         main.PROVIDER.embedding_model = ""
         response = {"choices": [{"message": {
-            "content": '{"matched":true,"confidence":0.91,"summary":"Climate software founder","roles":["Founder"],"offers":["climate domain expertise"],"sources":[{"title":"Profile","url":"https://example.com/alex","quote":"Alex builds climate software."}],"candidateConnections":[{"name":"Jordan Research","role":"ML architect","rationale":"Applied ML partner","supportedCapability":"applied ML partner","source":{"title":"Jordan profile","url":"https://example.com/jordan","quote":"Jordan designs applied ML systems."}}]}',
+            "content": '{"matched":true,"confidence":0.91,"summary":"Climate software founder","roles":["Founder"],"offers":["climate domain expertise"],"sources":[{"title":"Profile","url":"https://example.com/alex","quote":"Alex builds climate software."}],"candidateConnections":[{"name":"Jordan","role":"ML architect","rationale":"Applied ML partner","supportedCapability":"applied ML partner","source":{"title":"Jordan profile","url":"https://example.com/jordan","quote":"Jordan designs applied ML systems."}}]}',
             "annotations": [{"type": "url_citation", "url_citation": {"url": "https://example.com/alex", "title": "Profile", "content": "Alex builds climate software."}}, {"type": "url_citation", "url_citation": {"url": "https://example.com/jordan", "title": "Jordan profile", "content": "Jordan designs applied ML systems."}}],
         }}]}
         with patch.object(main.PROVIDER, "json_completion", return_value=None), patch.object(main.PROVIDER, "_post", return_value=response) as post:
@@ -58,7 +68,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(post.called)
         self.assertEqual(result["profile"]["publicOffers"], ["climate domain expertise"])
         self.assertEqual(result["profile"]["researchEvidence"][0]["sourceURL"], "https://example.com/alex")
-        self.assertEqual(result["profile"]["publicCandidates"][0]["name"], "Jordan Research")
+        self.assertEqual(result["profile"]["publicCandidates"][0]["name"], "Jordan")
         self.assertGreaterEqual(len(result["opportunities"]), 1)
         self.assertIn("verify_sources", [item["tool"] for item in result["trace"]])
 

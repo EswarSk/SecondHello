@@ -84,7 +84,9 @@ def mongodb_uri() -> str:
     if not (username and password and cluster_host):
         return ""
     database = env("MONGODB_DATABASE", "secondhello")
-    options = env("MONGODB_OPTIONS", "retryWrites=true&w=majority&appName=SecondHello")
+    raw_options = env("MONGODB_OPTIONS", "")
+    option_parts = [part for part in raw_options.split("&") if "=" in part]
+    options = "&".join(option_parts) or "retryWrites=true&w=majority&appName=SecondHello"
     encoded_user = urllib.parse.quote(username, safe="")
     encoded_password = urllib.parse.quote(password, safe="")
     encoded_database = urllib.parse.quote(database, safe="")
@@ -238,7 +240,8 @@ class Provider:
                 cited = citations.get(url, {})
                 name = str(candidate.get("name", "")).strip()
                 capability = str(candidate.get("supportedCapability", "")).strip()
-                if not (name and capability): continue
+                supporting_source = {**cited, **source}
+                if not (valid_person_name(name) and capability and source_mentions_name(name, supporting_source)): continue
                 candidates.append({
                     "name": name, "role": str(candidate.get("role", "")).strip(),
                     "rationale": str(candidate.get("rationale", "")).strip(), "supportedCapability": capability,
@@ -315,6 +318,57 @@ def sentences(text: str) -> list[str]:
     return [item.strip() for item in re.split(r"(?<=[.!?])\s+", text.strip()) if item.strip()]
 
 
+PERSON_NAME_STOPWORDS = {
+    "a", "about", "an", "and", "at", "for", "from", "here", "i", "in", "is", "it",
+    "just", "looking", "my", "of", "on", "or", "people", "seeking", "that", "the", "there",
+    "this", "to", "trying", "who", "with", "working",
+}
+
+
+def valid_person_name(value: Any) -> bool:
+    """Accept only a short, name-shaped value—not a sentence fragment."""
+    name = " ".join(str(value or "").strip().split())
+    if not name or len(name) > 100:
+        return False
+    if not re.fullmatch(r"[^\W\d_][\w'’-]*(?:\s+[^\W\d_][\w'’-]*){0,3}", name, flags=re.UNICODE):
+        return False
+    words = name.split()
+    return not any(word.casefold() in PERSON_NAME_STOPWORDS for word in words)
+
+
+def source_mentions_name(name: str, source: dict[str, Any]) -> bool:
+    """Require the cited title, quote, or URL to support a research candidate's name."""
+    tokens = [token.casefold() for token in re.findall(r"[^\W\d_]+", name, flags=re.UNICODE)]
+    if not tokens:
+        return False
+    source_text = " ".join(str(source.get(key, "")) for key in ("title", "url", "quote", "content")).casefold()
+    source_tokens = set(re.findall(r"[^\W\d_]+", source_text, flags=re.UNICODE))
+    compact_source = "".join(source_tokens)
+    return all(token in source_tokens for token in tokens) or "".join(tokens) in compact_source
+
+
+def sanitize_memory(memory: dict[str, Any]) -> dict[str, Any]:
+    """Keep untrusted historical records from entering matching or the UI."""
+    people = [person for person in memory.get("people", []) if isinstance(person, dict) and valid_person_name(person.get("name"))]
+    person_ids = {person.get("id") for person in people}
+    conversations = []
+    for original in memory.get("conversations", []):
+        if not isinstance(original, dict) or original.get("personID") not in person_ids:
+            continue
+        conversation = dict(original)
+        profile = dict(conversation.get("profile", {}))
+        profile["publicCandidates"] = [
+            candidate for candidate in profile.get("publicCandidates", [])
+            if isinstance(candidate, dict)
+            and valid_person_name(candidate.get("name"))
+            and isinstance(candidate.get("source"), dict)
+            and source_mentions_name(str(candidate.get("name")), candidate["source"])
+        ]
+        conversation["profile"] = profile
+        conversations.append(conversation)
+    return {**memory, "people": people, "conversations": conversations, "actions": memory.get("actions", [])}
+
+
 def local_profile(transcript: str, conversation_id: str) -> dict[str, Any]:
     lines = sentences(transcript)
     rules = {
@@ -361,6 +415,7 @@ class MemoryBackend:
         self.lock = threading.Lock()
         self.path = Path(env("SECONDHELLO_MEMORY_FILE") or (Path.home() / ".secondhello" / "memory.json"))
         self.mode = "Local JSON"
+        self.startup_warning = ""
         self.client = self.database = None
         uri = mongodb_uri()
         if uri:
@@ -379,18 +434,18 @@ class MemoryBackend:
 
     def load(self) -> dict[str, Any]:
         if self.database is not None:
-            return {
+            return sanitize_memory({
                 "schemaVersion": 2,
                 "people": list(self.database.people.find({}, {"_id": False})),
                 "conversations": list(self.database.conversations.find({}, {"_id": False, "embedding": False})),
                 "actions": list(self.database.actions.find({}, {"_id": False})),
-            }
+            })
         with self.lock:
             if not self.path.exists():
                 return self._empty()
             data = json.loads(self.path.read_text())
             data.setdefault("actions", [])
-            return data
+            return sanitize_memory(data)
 
     def _write_local(self, memory: dict[str, Any]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -426,7 +481,7 @@ class MemoryBackend:
 
     def load_unlocked(self) -> dict[str, Any]:
         if not self.path.exists(): return self._empty()
-        data = json.loads(self.path.read_text()); data.setdefault("actions", []); return data
+        data = json.loads(self.path.read_text()); data.setdefault("actions", []); return sanitize_memory(data)
 
     def record_action(self, receipt: dict[str, Any]) -> None:
         if self.database is not None:
@@ -467,6 +522,8 @@ def validate_and_route(state: WorkflowState) -> WorkflowState:
             return {"route": "end", "ok": False, "reason": "explicit_consent_required", "trace": trace(state, "consent_gate", "Blocked capture before extraction or storage", "policy")}
         if not str(conversation.get("transcript", "")).strip() or not state.get("person", {}).get("name"):
             return {"route": "end", "ok": False, "reason": "person_and_transcript_required", "trace": trace(state, "consent_gate", "Rejected incomplete capture", "policy")}
+        if not valid_person_name(state["person"]["name"]):
+            return {"route": "end", "ok": False, "reason": "valid_person_name_required", "trace": trace(state, "consent_gate", "Rejected a sentence fragment as a person name before extraction or storage", "policy")}
     return {"route": routes[action], "ok": True, "trace": trace(state, "consent_gate", "Permission and input checks passed", "policy")}
 
 
@@ -542,8 +599,8 @@ def profile_map(memory: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return profiles
 
 
-def evidence_for(profile: dict[str, Any], text: str) -> dict[str, Any]:
-    return next((item for item in profile.get("evidence", []) if text.lower() in item.get("quote", "").lower()), {"id": str(uuid4()), "quote": text, "conversationID": "", "capturedAt": utc_now()})
+def evidence_for(profile: dict[str, Any], text: str) -> dict[str, Any] | None:
+    return next((item for item in profile.get("evidence", []) if text.lower() in item.get("quote", "").lower()), None)
 
 
 def match_tool(state: WorkflowState) -> WorkflowState:
@@ -572,6 +629,9 @@ def match_tool(state: WorkflowState) -> WorkflowState:
     for recipient_id, recipient_profile in profiles.items():
         for need in recipient_profile.get("needs", []):
             query = query_embeddings[need]
+            need_evidence = evidence_for(recipient_profile, need)
+            if not need_evidence:
+                continue
             atlas = BACKEND.vector_offers(query, recipient_id)
             if atlas:
                 candidates = [(float(item.get("score", 0)), item["personID"], item["text"], {"id": str(uuid4()), "quote": item.get("quote", item["text"]), "conversationID": item.get("conversationID", ""), "capturedAt": item.get("capturedAt", utc_now()), "sourceURL": item.get("sourceURL"), "sourceTitle": item.get("sourceTitle")}) for item in atlas]
@@ -584,11 +644,11 @@ def match_tool(state: WorkflowState) -> WorkflowState:
                         offer_vector = document_embeddings[offer]
                         candidates.append((cosine(query, offer_vector), connector_id, offer, evidence_for(connector_profile, offer)))
             for score, connector_id, offer, offer_evidence in sorted(candidates, key=lambda item: item[0], reverse=True)[:1]:
-                if score < minimum or connector_id not in people or recipient_id not in people: continue
+                if score < minimum or not offer_evidence or connector_id not in people or recipient_id not in people: continue
                 opportunities.append({
                     "id": str(uuid4()), "recipientID": recipient_id, "recipientName": people[recipient_id]["name"], "recipientEmail": people[recipient_id].get("email"),
                     "connectorID": connector_id, "connectorName": people[connector_id]["name"], "connectorEmail": people[connector_id].get("email"),
-                    "need": need, "offer": offer, "score": round(score, 3), "needEvidence": evidence_for(recipient_profile, need),
+                    "need": need, "offer": offer, "score": round(score, 3), "needEvidence": need_evidence,
                     "offerEvidence": offer_evidence, "searchMode": search_mode + (" + cited public research" if offer_evidence.get("sourceURL") else ""),
                 })
             for candidate in recipient_profile.get("publicCandidates", []):
@@ -604,7 +664,7 @@ def match_tool(state: WorkflowState) -> WorkflowState:
                     "id": str(uuid5(NAMESPACE_URL, recipient_id + candidate_id + need)),
                     "recipientID": recipient_id, "recipientName": people[recipient_id]["name"], "recipientEmail": people[recipient_id].get("email"),
                     "connectorID": candidate_id, "connectorName": str(candidate.get("name", "Public candidate")), "connectorEmail": None,
-                    "need": need, "offer": capability, "score": round(score, 3), "needEvidence": evidence_for(recipient_profile, need),
+                    "need": need, "offer": capability, "score": round(score, 3), "needEvidence": need_evidence,
                     "offerEvidence": {"id": str(uuid4()), "quote": str(source.get("quote") or candidate.get("rationale") or capability), "conversationID": "", "capturedAt": utc_now(), "sourceURL": source.get("url"), "sourceTitle": source.get("title")},
                     "searchMode": "OpenRouter Web Search · public candidate",
                 })
@@ -676,6 +736,8 @@ def health() -> dict[str, Any]:
         "ok": True,
         "workflow": "LangGraph" if GRAPH is not None else "Local graph runtime",
         "storage": BACKEND.mode,
+        "storageFallback": BACKEND.mode != "MongoDB Atlas",
+        "storageNotice": getattr(BACKEND, "startup_warning", "") if BACKEND.mode != "MongoDB Atlas" else "",
         "provider": PROVIDER.name,
         "vectorSearch": bool(BACKEND.database is not None and env("MONGODB_VECTOR_INDEX")),
         "publicResearch": PROVIDER.name == "OpenRouter" and env("SECONDHELLO_PUBLIC_RESEARCH", "1") != "0",
