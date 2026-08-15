@@ -64,7 +64,7 @@ function eventLabel(event) {
     research: "Researching public professional sources",
     verify_research: "Verifying identity and source evidence",
     persist: "Saving consented memory to the relationship graph",
-    match: "Searching for complementary opportunities",
+    match: "Searching for relevant connections",
     rank: "Ranking evidence-backed introductions",
     draft: "Preparing a human-reviewed connection note",
     record_action: "Recording the approved handoff",
@@ -289,7 +289,7 @@ function App() {
       if (finishRequestedRef.current && !workflowQueuedRef.current && transcriptRef.current === textSnapshot) {
         finishRequestedRef.current = false;
         setPhase("saved");
-        setStatusText("Saved live · People, evidence, and opportunities are updated");
+        setStatusText("Saved live · People, memory, and connections are updated");
       } else if (!finishRequestedRef.current) {
         setStatusText(result?.opportunities ? "Agent synced · still listening for the next turn" : "Agent is listening for more context");
       }
@@ -306,7 +306,7 @@ function App() {
       } else if (finishRequestedRef.current && phaseRef.current === "reviewing") {
         finishRequestedRef.current = false;
         setPhase("saved");
-        setStatusText("Saved live · People, evidence, and opportunities are updated");
+        setStatusText("Saved live · People, memory, and connections are updated");
       }
     }
   }
@@ -411,7 +411,7 @@ function App() {
   };
 
   const deleteMemory = async () => {
-    if (!window.confirm("Delete every person, conversation, opportunity, and action from this self-hosted instance? This cannot be undone.")) return;
+    if (!window.confirm("Delete every person, conversation, connection, and action from this self-hosted instance? This cannot be undone.")) return;
     try {
       const response = await fetch(apiPath("/api/memory"), { method: "DELETE", headers: { ...authHeaders(token), "X-SecondHello-Confirm": "DELETE_ALL" } });
       if (!response.ok) throw new Error("Memory deletion failed");
@@ -430,7 +430,7 @@ function App() {
   }, []).slice(-7);
   const activityView = compactActivity.length ? compactActivity.map((item, index) => <div className={`activity-event ${index === compactActivity.length - 1 ? "current" : ""}`} key={item.id}><span className="event-marker">{item.type === "workflow.failed" ? "!" : item.type === "workflow.completed" ? "✓" : "·"}</span><div><strong>{item.title}</strong><small>{item.detail}</small></div><time>{index === compactActivity.length - 1 ? "now" : "done"}</time></div>) : <div className="empty-activity"><span>✦</span><div><strong>Background work will appear here</strong><p>After consent, this shows the current step in plain language.</p></div></div>;
   const latestPersonHasOpportunity = latestPerson && opportunities.some((opportunity) => opportunity.recipientID === latestPerson.id || opportunity.connectorID === latestPerson.id);
-  const latestConnectionNotice = latestPerson && !latestPersonHasOpportunity ? <div className="empty-panel latest-person-state"><strong>{latestPerson.name} is saved in People.</strong><p>No verified connection for this person yet. The agent needs a compatible, evidence-backed need and offer before it creates an opportunity.</p></div> : null;
+  const latestConnectionNotice = latestPerson && !latestPersonHasOpportunity ? <div className="empty-panel latest-person-state"><strong>{latestPerson.name} is saved in People.</strong><p>No verified connection for this person yet. The assistant needs a compatible, evidence-backed need and offer before it creates a connection.</p></div> : null;
 
   return (
     <div className="app-shell">
@@ -438,7 +438,7 @@ function App() {
         <div className="brand"><span className="brand-mark">✦</span><div><strong>SECOND HELLO</strong><span>network memory, live</span></div></div>
         <div className="side-section-label">WORKSPACE</div>
         <button className="nav-item active"><span>◉</span> Live room <span className="nav-count">{people.length}</span></button>
-        <button className="nav-item" onClick={() => document.getElementById("opportunities")?.scrollIntoView({ behavior: "smooth" })}><span>⌁</span> Opportunities <span className="nav-count">{opportunities.length}</span></button>
+        <button className="nav-item" onClick={() => document.getElementById("connections")?.scrollIntoView({ behavior: "smooth" })}><span>⌁</span> Connections <span className="nav-count">{opportunities.length}</span></button>
         <button className="nav-item" onClick={() => document.getElementById("people")?.scrollIntoView({ behavior: "smooth" })}><span>♧</span> People <span className="nav-count">{people.length}</span></button>
         <div className="sidebar-bottom">
           <div className="status-card"><span className={`status-dot ${health?.ok ? "online" : ""}`}></span><div><strong>{health?.ok ? "Agent online" : "Connecting…"}</strong><small>{health?.storageFallback ? `${storageLabel} fallback` : storageLabel} · {modeLabel}</small></div></div>
@@ -447,7 +447,7 @@ function App() {
       </aside>
 
       <main className="main-canvas">
-        <header className="topbar"><div><span className="eyebrow">CONSENT-FIRST NETWORKING AGENT</span><h1>Remember the room while you’re still in it.</h1><p>Consent once, then keep talking. Speech-to-text, public research, evidence, and matching run beside the live voice room as the conversation unfolds.</p></div><div className="top-actions"><span className={`pill ${consent ? "pill-green" : "pill-muted"}`}>{consent ? "● Consent armed" : "○ Consent off"}</span><button className="ghost-button" onClick={() => setSettingsOpen(true)}>Deploy locally ↗</button></div></header>
+        <header className="topbar"><div><span className="eyebrow">YOUR PRIVATE NETWORK MEMORY ASSISTANT</span><h1>Remember the room while you’re still in it.</h1><p>Consent once, then keep talking. I’ll remember who you met, what you discussed, and which connections are worth following up on.</p></div><div className="top-actions"><span className={`pill ${consent ? "pill-green" : "pill-muted"}`}>{consent ? "● Consent armed" : "○ Consent off"}</span><button className="ghost-button" onClick={() => setSettingsOpen(true)}>Deploy locally ↗</button></div></header>
 
         {error && <div className="error-banner"><span>!</span><div><strong>Action needs attention</strong><p>{error}</p></div><button onClick={() => setError("")}>×</button></div>}
 
@@ -472,7 +472,7 @@ function App() {
           <div className="agent-panel card"><div className="section-heading compact"><div><span className="eyebrow">BACKGROUND WORK</span><h2>What the agent is doing</h2></div><span className={`agent-state ${workflowBusy ? "working" : ""}`}>{workflowBusy ? "WORKING" : phase === "listening" ? "LISTENING" : "READY"}</span></div><div className="activity-rail">{activityView}</div></div>
         </section>
 
-        <section className="insights-grid" id="people"><div className="insight-panel card"><div className="section-heading compact"><div><span className="eyebrow">RELATIONSHIP GRAPH</span><h2>People in the room</h2></div><span className="number-badge">{people.length}</span></div>{people.length ? people.slice(-4).reverse().map((person) => <div className="person-row" key={person.id}><div className="avatar">{person.name?.slice(0, 1).toUpperCase()}</div><div><strong>{person.name}</strong><small>{person.email || "Professional context captured"}</small></div><span className="row-status">{person.id === latestPerson?.id ? "Just now" : "Remembered"}</span></div>) : <div className="empty-panel">Consent to a conversation and the person will appear here immediately.</div>}</div><div className="insight-panel card" id="opportunities"><div className="section-heading compact"><div><span className="eyebrow">SOURCE-BACKED LEADS</span><h2>Possible connections</h2></div><span className="number-badge accent">{opportunities.length}</span></div>{latestConnectionNotice}{opportunities.length ? opportunities.slice(0, 3).map((opportunity) => <button className="opportunity-row" key={opportunity.id} onClick={() => openDraft(opportunity)}><div className="match-line"><span>{opportunity.recipientName}</span><b>↔</b><span>{opportunity.connectorName}</span><em>{Math.round((opportunity.score || 0) * 100)}%</em></div><p><strong>{opportunity.connectorName}</strong> may help with <strong>{opportunity.need}</strong>, based on {opportunity.offer}.</p><small>{opportunity.searchMode} · Review source {icons.arrow}</small></button>) : !latestConnectionNotice && <div className="empty-panel">No source-backed connection leads yet. Keep talking or add another person.</div>}</div></section>
+        <section className="insights-grid" id="people"><div className="insight-panel card"><div className="section-heading compact"><div><span className="eyebrow">RELATIONSHIP GRAPH</span><h2>People in the room</h2></div><span className="number-badge">{people.length}</span></div>{people.length ? people.slice(-4).reverse().map((person) => <div className="person-row" key={person.id}><div className="avatar">{person.name?.slice(0, 1).toUpperCase()}</div><div><strong>{person.name}</strong><small>{person.email || "Professional context captured"}</small></div><span className="row-status">{person.id === latestPerson?.id ? "Just now" : "Remembered"}</span></div>) : <div className="empty-panel">Consent to a conversation and the person will appear here immediately.</div>}</div><div className="insight-panel card" id="connections"><div className="section-heading compact"><div><span className="eyebrow">SOURCE-BACKED CONNECTIONS</span><h2>Connections to follow up on</h2></div><span className="number-badge accent">{opportunities.length}</span></div>{latestConnectionNotice}{opportunities.length ? opportunities.slice(0, 3).map((opportunity) => <button className="opportunity-row" key={opportunity.id} onClick={() => openDraft(opportunity)}><div className="match-line"><span>{opportunity.recipientName}</span><b>↔</b><span>{opportunity.connectorName}</span><em>{Math.round((opportunity.score || 0) * 100)}%</em></div><p><strong>{opportunity.connectorName}</strong> may help with <strong>{opportunity.need}</strong>, based on {opportunity.offer}.</p><small>{opportunity.searchMode} · Review source {icons.arrow}</small></button>) : !latestConnectionNotice && <div className="empty-panel">No source-backed connections yet. Keep talking and the assistant will remember the context.</div>}</div></section>
 
         <footer className="footer"><span>Second Hello is local-first by design.</span><span>Consent receipt · Human approval · Nothing sent automatically</span></footer>
       </main>

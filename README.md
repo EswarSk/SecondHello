@@ -1,6 +1,6 @@
 # Second Hello
 
-Second Hello is a self-hostable, consent-first networking memory agent. It turns explicitly permitted conversations into structured memory, researches public professional context, finds evidence-backed introductions, and prepares a human-reviewed handoff. It never sends a message autonomously.
+Second Hello is a self-hostable, consent-first personal network memory assistant. It lets one person keep talking instead of taking notes: it remembers who they met, what they discussed, researches public professional context, finds evidence-backed connections, and prepares a human-reviewed handoff. It never sends a message autonomously.
 
 The production surface is a browser/PWA client served by the local agent service. The macOS client remains available as an optional native client. Each deployment owns its data and provider credentials; no Second Hello-hosted account is required.
 
@@ -60,8 +60,8 @@ The demo tells one complete story rather than touring settings:
 
 1. Open the local live room, arm consent, and choose **Start live room**. Passive ElevenLabs Scribe realtime speech-to-text connects; no voice-response session is opened, so the room is never interrupted. Partial speech appears immediately while committed turns enter the transcript.
 2. Keep talking. Once a clear name and meaningful context are present, the LangGraph workflow starts automatically in the background. Its guard, extraction, public research, evidence, persistence, and matching events appear in the **Live agent activity** sidecar while the room remains open.
-3. Stop the room only when you want the final sync. There is no “Remember person” submit step; consented turns are saved continuously and the final state updates People, evidence, and Opportunities.
-4. Choose an opportunity to review the editable introduction draft. The mail handoff remains human-approved and nothing is sent automatically.
+3. Stop the room only when you want the final sync. There is no “Remember person” submit step; consented turns are saved continuously and the final state updates People, evidence, and Connections.
+4. Choose a connection to review the editable introduction draft. The mail handoff remains human-approved and nothing is sent automatically.
 4. Choose **Show evidence** to reveal the exact source excerpts behind both sides of the match.
 5. Choose **Prepare introduction**, review the editable draft, explicitly approve the handoff, and open a real draft in the default mail app. The mail app remains responsible for sending.
 
