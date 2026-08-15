@@ -184,8 +184,9 @@ function App() {
   useEffect(() => { loadState(); }, [loadState]);
 
   const people = memory.people || [];
-  const latestPerson = people[people.length - 1];
-  const currentConversation = memory.conversations?.find((item) => item.personID === latestPerson?.id) || null;
+  const orderedConversations = [...(memory.conversations || [])].sort((left, right) => String(left.timestamp || "").localeCompare(String(right.timestamp || "")));
+  const currentConversation = orderedConversations.at(-1) || null;
+  const latestPerson = people.find((person) => person.id === currentConversation?.personID) || people[people.length - 1];
   const profile = currentConversation?.profile || null;
   const modeLabel = health?.provider || "Local deterministic";
   const storageLabel = health?.storage || "Local JSON";
@@ -214,8 +215,8 @@ function App() {
   }
 
   function scheduleLiveWorkflow(textSnapshot, nameSnapshot) {
-    if (!consentRef.current || !isPersonName(nameSnapshot)) return;
-    if (!nameSnapshot) {
+    if (!consentRef.current) return;
+    if (!nameSnapshot || !isPersonName(nameSnapshot)) {
       setStatusText("Listening · waiting for a clear introduction");
       return;
     }
@@ -428,6 +429,8 @@ function App() {
     return items;
   }, []).slice(-7);
   const activityView = compactActivity.length ? compactActivity.map((item, index) => <div className={`activity-event ${index === compactActivity.length - 1 ? "current" : ""}`} key={item.id}><span className="event-marker">{item.type === "workflow.failed" ? "!" : item.type === "workflow.completed" ? "✓" : "·"}</span><div><strong>{item.title}</strong><small>{item.detail}</small></div><time>{index === compactActivity.length - 1 ? "now" : "done"}</time></div>) : <div className="empty-activity"><span>✦</span><div><strong>Background work will appear here</strong><p>After consent, this shows the current step in plain language.</p></div></div>;
+  const latestPersonHasOpportunity = latestPerson && opportunities.some((opportunity) => opportunity.recipientID === latestPerson.id || opportunity.connectorID === latestPerson.id);
+  const latestConnectionNotice = latestPerson && !latestPersonHasOpportunity ? <div className="empty-panel latest-person-state"><strong>{latestPerson.name} is saved in People.</strong><p>No verified connection for this person yet. The agent needs a compatible, evidence-backed need and offer before it creates an opportunity.</p></div> : null;
 
   return (
     <div className="app-shell">
@@ -469,7 +472,7 @@ function App() {
           <div className="agent-panel card"><div className="section-heading compact"><div><span className="eyebrow">BACKGROUND WORK</span><h2>What the agent is doing</h2></div><span className={`agent-state ${workflowBusy ? "working" : ""}`}>{workflowBusy ? "WORKING" : phase === "listening" ? "LISTENING" : "READY"}</span></div><div className="activity-rail">{activityView}</div></div>
         </section>
 
-        <section className="insights-grid" id="people"><div className="insight-panel card"><div className="section-heading compact"><div><span className="eyebrow">RELATIONSHIP GRAPH</span><h2>People in the room</h2></div><span className="number-badge">{people.length}</span></div>{people.length ? people.slice(-4).reverse().map((person) => <div className="person-row" key={person.id}><div className="avatar">{person.name?.slice(0, 1).toUpperCase()}</div><div><strong>{person.name}</strong><small>{person.email || "Professional context captured"}</small></div><span className="row-status">{person.id === latestPerson?.id ? "Just now" : "Remembered"}</span></div>) : <div className="empty-panel">Consent to a conversation and the person will appear here immediately.</div>}</div><div className="insight-panel card" id="opportunities"><div className="section-heading compact"><div><span className="eyebrow">SOURCE-BACKED LEADS</span><h2>Possible connections</h2></div><span className="number-badge accent">{opportunities.length}</span></div>{opportunities.length ? opportunities.slice(0, 3).map((opportunity) => <button className="opportunity-row" key={opportunity.id} onClick={() => openDraft(opportunity)}><div className="match-line"><span>{opportunity.recipientName}</span><b>↔</b><span>{opportunity.connectorName}</span><em>{Math.round((opportunity.score || 0) * 100)}%</em></div><p><strong>{opportunity.connectorName}</strong> may help with <strong>{opportunity.need}</strong>, based on {opportunity.offer}.</p><small>{opportunity.searchMode} · Review source {icons.arrow}</small></button>) : <div className="empty-panel">No source-backed connection leads yet. Keep talking or add another person.</div>}</div></section>
+        <section className="insights-grid" id="people"><div className="insight-panel card"><div className="section-heading compact"><div><span className="eyebrow">RELATIONSHIP GRAPH</span><h2>People in the room</h2></div><span className="number-badge">{people.length}</span></div>{people.length ? people.slice(-4).reverse().map((person) => <div className="person-row" key={person.id}><div className="avatar">{person.name?.slice(0, 1).toUpperCase()}</div><div><strong>{person.name}</strong><small>{person.email || "Professional context captured"}</small></div><span className="row-status">{person.id === latestPerson?.id ? "Just now" : "Remembered"}</span></div>) : <div className="empty-panel">Consent to a conversation and the person will appear here immediately.</div>}</div><div className="insight-panel card" id="opportunities"><div className="section-heading compact"><div><span className="eyebrow">SOURCE-BACKED LEADS</span><h2>Possible connections</h2></div><span className="number-badge accent">{opportunities.length}</span></div>{latestConnectionNotice}{opportunities.length ? opportunities.slice(0, 3).map((opportunity) => <button className="opportunity-row" key={opportunity.id} onClick={() => openDraft(opportunity)}><div className="match-line"><span>{opportunity.recipientName}</span><b>↔</b><span>{opportunity.connectorName}</span><em>{Math.round((opportunity.score || 0) * 100)}%</em></div><p><strong>{opportunity.connectorName}</strong> may help with <strong>{opportunity.need}</strong>, based on {opportunity.offer}.</p><small>{opportunity.searchMode} · Review source {icons.arrow}</small></button>) : !latestConnectionNotice && <div className="empty-panel">No source-backed connection leads yet. Keep talking or add another person.</div>}</div></section>
 
         <footer className="footer"><span>Second Hello is local-first by design.</span><span>Consent receipt · Human approval · Nothing sent automatically</span></footer>
       </main>
