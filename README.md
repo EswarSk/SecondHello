@@ -58,7 +58,7 @@ Run the complete release check before distributing a build:
 
 The demo tells one complete story rather than touring settings:
 
-1. Open the local live room, arm consent, and choose **Start live room**. The private ElevenLabs voice agent and Scribe realtime speech-to-text connect together; partial speech appears immediately while committed turns enter the transcript.
+1. Open the local live room, arm consent, and choose **Start live room**. Passive ElevenLabs Scribe realtime speech-to-text connects; no voice-response session is opened, so the room is never interrupted. Partial speech appears immediately while committed turns enter the transcript.
 2. Keep talking. Once a clear name and meaningful context are present, the LangGraph workflow starts automatically in the background. Its guard, extraction, public research, evidence, persistence, and matching events appear in the **Live agent activity** sidecar while the room remains open.
 3. Stop the room only when you want the final sync. There is no “Remember person” submit step; consented turns are saved continuously and the final state updates People, evidence, and Opportunities.
 4. Choose an opportunity to review the editable introduction draft. The mail handoff remains human-approved and nothing is sent automatically.

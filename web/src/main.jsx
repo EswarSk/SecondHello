@@ -1,13 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import {
-  ConversationProvider,
-  useScribe,
-  useConversation,
-  useConversationControls,
-  useConversationInput,
-  useConversationStatus,
-} from "@elevenlabs/react";
+import { useScribe } from "@elevenlabs/react";
 import "./styles.css";
 
 const API = (import.meta.env.VITE_API_BASE_URL || "").replace(/\/$/, "");
@@ -63,13 +56,7 @@ function eventLabel(event) {
 }
 
 function Provider({ children }) {
-  const [muted, setMuted] = useState(false);
-  const handleError = useCallback((error) => console.error("Second Hello voice error", error), []);
-  return (
-    <ConversationProvider isMuted={muted} onMutedChange={setMuted} onError={handleError}>
-      {children}
-    </ConversationProvider>
-  );
+  return children;
 }
 
 function App() {
@@ -118,9 +105,6 @@ function App() {
   useEffect(() => { phaseRef.current = phase; }, [phase]);
   useEffect(() => { consentRef.current = consent; }, [consent]);
 
-  const { status: voiceStatus } = useConversationStatus();
-  const { startSession, endSession } = useConversationControls();
-  const { isMuted, setMuted } = useConversationInput();
   const scribe = useScribe({
     modelId: "scribe_v2_realtime",
     onPartialTranscript: (data) => {
@@ -132,27 +116,6 @@ function App() {
       appendActivity({ type: "agent.notice", trace: { detail: `Realtime transcription issue: ${displayError(scribeError)}`, mode: "ElevenLabs Scribe" } });
     },
   });
-  const conversation = useConversation({
-    onMessage: (message) => {
-      const source = message?.source || message?.type;
-      const text = message?.message || message?.text || message?.user_transcription_event?.user_transcript || "";
-      if (!text || (source && source !== "user" && source !== "user_transcript" && !message?.user_transcription_event)) return;
-      handleTranscriptSegment(text);
-    },
-    onStatusChange: (value) => {
-      const status = typeof value === "string" ? value : value?.status;
-      if (status) setStatusText(status === "connected" ? "Live voice session is active" : `Voice session ${status}`);
-    },
-    onModeChange: (value) => {
-      const mode = typeof value === "string" ? value : value?.mode;
-      if (mode) setStatusText(mode === "speaking" ? "Second Hello is responding" : "Listening quietly in the background");
-    },
-    onVadScore: (value) => {
-      const score = typeof value === "number" ? value : value?.score;
-      if (typeof score === "number" && score > 0.1) setStatusText("Microphone signal detected · listening");
-    },
-  });
-
   const loadState = useCallback(async ({ includeMatches = true } = {}) => {
     setError("");
     try {
@@ -330,30 +293,28 @@ function App() {
       setName(name.trim());
       setVoiceMessages([]);
       setActivity([{ type: "voice.started", trace: { detail: "Live room opened; speech-to-text and LangGraph are standing by", mode: "Live room" } }]);
-      const [voiceResponse, scribeResponse] = await Promise.all([
-        fetch(apiPath("/api/voice/signed-url"), { headers: authHeaders(token) }),
-        fetch(apiPath("/api/voice/scribe-token"), { method: "POST", headers: authHeaders(token, true), body: JSON.stringify({}) }),
-      ]);
-      const voiceBody = await voiceResponse.json();
+      const scribeResponse = await fetch(apiPath("/api/voice/scribe-token"), {
+        method: "POST",
+        headers: authHeaders(token, true),
+        body: JSON.stringify({}),
+      });
       const scribeBody = await scribeResponse.json();
-      if (!voiceResponse.ok) {
-        if (voiceResponse.status === 401) throw new Error("Authentication required. Add the self-hosted bearer token in Settings.");
-        throw new Error(voiceBody.reason || voiceBody.error || voiceBody.detail || `Voice service failed (${voiceResponse.status})`);
+      if (!scribeResponse.ok) {
+        if (scribeResponse.status === 401) throw new Error("Authentication required. Add the self-hosted bearer token in Settings.");
+        throw new Error(scribeBody.reason || scribeBody.error || scribeBody.detail || `Realtime transcription service failed (${scribeResponse.status})`);
       }
-      if (!voiceBody.signedUrl) throw new Error(voiceBody.reason || voiceBody.error || voiceBody.detail || "Voice agent is not configured");
+      if (!scribeBody.token) throw new Error(scribeBody.reason || scribeBody.error || scribeBody.detail || "Realtime transcription is not configured");
       setPhase("listening");
       phaseRef.current = "listening";
-      const started = await Promise.allSettled([
-        startSession({ signedUrl: voiceBody.signedUrl, userId }),
-        scribeResponse.ok && scribeBody.token
-          ? scribe.connect({ token: scribeBody.token, modelId: scribeBody.modelId || "scribe_v2_realtime", microphone: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } })
-          : Promise.reject(new Error(scribeBody.reason || "Realtime transcription token unavailable")),
-      ]);
-      if (started[0].status === "rejected") throw started[0].reason;
-      appendActivity({ type: "agent.notice", trace: { detail: started[1].status === "fulfilled" ? "Realtime speech-to-text connected; the agent will process each meaningful turn" : "Voice agent connected; realtime Scribe is unavailable, so conversation transcripts will be used when delivered", mode: started[1].status === "fulfilled" ? "ElevenLabs Scribe" : "Voice fallback" } });
-      setStatusText(started[1].status === "fulfilled" ? "Listening live · agent is ready to work in parallel" : "Listening live · transcript fallback active");
+      await scribe.connect({
+        token: scribeBody.token,
+        modelId: scribeBody.modelId || "scribe_v2_realtime",
+        microphone: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
+      appendActivity({ type: "agent.notice", trace: { detail: "Passive realtime speech-to-text connected; no voice response will interrupt the room", mode: "ElevenLabs Scribe" } });
+      setStatusText("Listening live · passive transcript active");
     } catch (caught) {
-      try { await scribe.disconnect(); } catch (_) { /* the voice session may not have opened */ }
+      try { await scribe.disconnect(); } catch (_) { /* the Scribe session may not have opened */ }
       setPhase("idle");
       phaseRef.current = "idle";
       setStatusText("Voice session could not start");
@@ -366,7 +327,7 @@ function App() {
     phaseRef.current = "reviewing";
     finishRequestedRef.current = true;
     setStatusText("Voice session ended · finishing the live agent run");
-    try { await Promise.allSettled([endSession(), scribe.disconnect()]); } catch (caught) { setError(displayError(caught)); }
+    try { await scribe.disconnect(); } catch (caught) { setError(displayError(caught)); }
     if (!workflowInFlightRef.current) {
       if (nameRef.current && transcriptRef.current.trim()) await runLiveWorkflow(transcriptRef.current, nameRef.current, true);
       else {
@@ -445,11 +406,11 @@ function App() {
 
         <section className="live-grid">
           <div className="live-card card">
-            <div className="card-kicker"><span className="live-badge"><i></i> LIVE ROOM</span><span>{voiceStatus === "connected" ? "ElevenLabs voice" : "Ready when you are"}</span></div>
+            <div className="card-kicker"><span className="live-badge"><i></i> LIVE ROOM</span><span>{phase === "listening" ? "Passive listener · Scribe realtime" : "Ready when you are"}</span></div>
             <div className={`orb-wrap ${phase === "listening" ? "is-live" : ""}`}><div className="orb-ring ring-one"></div><div className="orb-ring ring-two"></div><div className="orb"><span>{phase === "listening" ? icons.mic : phase === "processing" ? "…" : icons.spark}</span></div></div>
             <div className="live-copy"><h2>{phase === "listening" ? "Listening quietly" : phase === "processing" ? "Working through the graph" : phase === "saved" ? "Memory is live" : "Ready to remember"}</h2><p>{statusText}</p></div>
             <div className="live-controls">
-              {phase === "listening" ? <><button className="primary-button stop" onClick={stopVoice}>{icons.stop} Stop & finish sync</button><button className="icon-button" onClick={() => setMuted(!isMuted)}>{isMuted ? "Unmute" : "Mute"}</button></> : <button className="primary-button" disabled={!consent || phase === "processing" || phase === "reviewing"} onClick={startVoice}>{icons.mic} {phase === "saved" ? "Start another live room" : phase === "reviewing" ? "Finishing live memory…" : "Start live room"}</button>}
+              {phase === "listening" ? <><button className="primary-button stop" onClick={stopVoice}>{icons.stop} Stop & finish sync</button><button className="icon-button" onClick={() => scribe.isMuted ? scribe.unmute() : scribe.mute()}>{scribe.isMuted ? "Resume mic" : "Pause mic"}</button></> : <button className="primary-button" disabled={!consent || phase === "processing" || phase === "reviewing"} onClick={startVoice}>{icons.mic} {phase === "saved" ? "Start another live room" : phase === "reviewing" ? "Finishing live memory…" : "Start live room"}</button>}
             </div>
             <div className="consent-row"><span className={`consent-switch ${consent ? "on" : ""}`} onClick={() => setConsent(!consent)}><i></i></span><div><strong>{consent ? "Permission active" : "Permission required"}</strong><small>{consent ? "Mic, live transcript, and background agent are enabled." : "Nothing is recorded, extracted, researched, or stored."}</small></div><span className="lock">{icons.lock}</span></div>
           </div>
@@ -469,7 +430,7 @@ function App() {
         <footer className="footer"><span>Second Hello is local-first by design.</span><span>Consent receipt · Human approval · Nothing sent automatically</span></footer>
       </main>
 
-      {settingsOpen && <div className="modal-backdrop" onClick={() => setSettingsOpen(false)}><div className="settings-modal" onClick={(event) => event.stopPropagation()}><button className="modal-close" onClick={() => setSettingsOpen(false)}>×</button><span className="eyebrow">SELF-HOSTED DEPLOYMENT</span><h2>Connect this client to your agent</h2><p>Run the Python service locally or behind your own TLS reverse proxy. The browser only receives a short-lived voice URL; provider keys stay on the server.</p><label>Bearer token<input type="password" value={tokenDraft} onChange={(event) => setTokenDraft(event.target.value)} placeholder="SECONDHELLO_AUTH_TOKEN (optional in development)" /></label><div className="settings-actions"><button className="ghost-button" onClick={() => { setTokenDraft(""); localStorage.removeItem(AUTH_KEY); setToken(""); }}>Clear token</button><button className="primary-button" onClick={saveToken}>Save & reconnect</button></div><div className="settings-note"><span>✓</span><small>API base: {API || "same origin"}<br />User identity: {userId.slice(0, 18)}…</small></div><div className="data-actions"><button className="ghost-button" onClick={exportMemory}>Export relationship data</button><button className="danger-button" onClick={deleteMemory}>Delete all data</button></div></div></div>}
+      {settingsOpen && <div className="modal-backdrop" onClick={() => setSettingsOpen(false)}><div className="settings-modal" onClick={(event) => event.stopPropagation()}><button className="modal-close" onClick={() => setSettingsOpen(false)}>×</button><span className="eyebrow">SELF-HOSTED DEPLOYMENT</span><h2>Connect this client to your agent</h2><p>Run the Python service locally or behind your own TLS reverse proxy. The browser receives only a short-lived realtime transcription token; provider keys stay on the server.</p><label>Bearer token<input type="password" value={tokenDraft} onChange={(event) => setTokenDraft(event.target.value)} placeholder="SECONDHELLO_AUTH_TOKEN (optional in development)" /></label><div className="settings-actions"><button className="ghost-button" onClick={() => { setTokenDraft(""); localStorage.removeItem(AUTH_KEY); setToken(""); }}>Clear token</button><button className="primary-button" onClick={saveToken}>Save & reconnect</button></div><div className="settings-note"><span>✓</span><small>API base: {API || "same origin"}<br />User identity: {userId.slice(0, 18)}…</small></div><div className="data-actions"><button className="ghost-button" onClick={exportMemory}>Export relationship data</button><button className="danger-button" onClick={deleteMemory}>Delete all data</button></div></div></div>}
       {draft && selectedOpportunity && <div className="modal-backdrop" onClick={() => setDraft(null)}><div className="draft-modal" onClick={(event) => event.stopPropagation()}><button className="modal-close" onClick={() => setDraft(null)}>×</button><span className="eyebrow">HUMAN-REVIEWED HANDOFF</span><h2>Connection note ready</h2><p>Second Hello prepared a draft for {selectedOpportunity.recipientName} and {selectedOpportunity.connectorName}. Nothing has been sent.</p><label>Subject<input value={draft.subject} onChange={(event) => setDraft({ ...draft, subject: event.target.value })} /></label><label>Body<textarea value={draft.body} onChange={(event) => setDraft({ ...draft, body: event.target.value })} /></label><div className="settings-actions"><button className="ghost-button" onClick={() => setDraft(null)}>Keep in tracker</button><button className="primary-button" onClick={() => { window.location.href = `mailto:${encodeURIComponent(draft.to || "")}?cc=${encodeURIComponent(draft.cc || "")}&subject=${encodeURIComponent(draft.subject)}&body=${encodeURIComponent(draft.body)}`; setDraft(null); }}>Open my mail app ↗</button></div></div></div>}
     </div>
   );

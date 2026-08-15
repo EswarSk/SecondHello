@@ -680,6 +680,7 @@ def health() -> dict[str, Any]:
         "vectorSearch": bool(BACKEND.database is not None and env("MONGODB_VECTOR_INDEX")),
         "publicResearch": PROVIDER.name == "OpenRouter" and env("SECONDHELLO_PUBLIC_RESEARCH", "1") != "0",
         "voiceAgentConfigured": bool(env("ELEVENLABS_API_KEY") and env("ELEVENLABS_AGENT_ID")),
+        "realtimeTranscriptionConfigured": bool(env("ELEVENLABS_API_KEY")),
         "safeFallback": True,
     }
 
